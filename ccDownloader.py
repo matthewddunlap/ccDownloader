@@ -1,12 +1,12 @@
 """
-Card Conjurer Selenium Downloader - Optimized Version
+Card Conjurer Selenium Downloader - Canvas Capture Version
 
-This script automates downloading cards from Card Conjurer using Selenium.
-Features optimized delays and configurable timing.
+Captures card images directly from the canvas using toDataURL and zips them.
+Inspired by Tampermonkey direct capture techniques for speed and reliability.
 
 Requirements (install with apt):
 - python3-selenium
-- python3-pil 
+- python3-pil (Pillow - optional, for image verification if needed, not used for saving here)
 - chromium-driver (or google-chrome-stable)
 """
 
@@ -14,1014 +14,523 @@ import os
 import sys
 import time
 import json
-import zipfile
-import base64
 import logging
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+import zipfile
+import base64
+import hashlib
+from typing import Optional, Tuple
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from PIL import Image
-from io import BytesIO
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
 
 class CardConjurerDownloader:
     def __init__(self, url="http://mtgproxy:4242", download_dir=None, log_level=logging.INFO):
         """Initialize the Card Conjurer downloader with logging."""
         self.url = url
+        # Download directory is still used for logs and the final ZIP file
         self.download_dir = download_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
         self.driver = None
         self.cards = []
-        
-        # Configurable delays (in seconds)
+
         self.delays = {
-            'page_load': 1.0,      # Reduced from 3
-            'tab_switch': 0.3,     # Reduced from 1
-            'file_upload': 1.0,    # Reduced from 3  
-            'card_load': 0.5,      # Reduced from 2
-            'frame_set': 0.3,      # Reduced from 1
-            'download_wait': 5.0,  # Reduced from 10
-            'element_wait': 5.0,   # Reduced from 10
-            'js_init': 1.0         # Reduced from 2
+            'page_load': 0.1,
+            'tab_switch': 0.1,
+            'file_upload_wait': 10.0, 
+            'card_load_js_ops': 0.2, # Minimal delay after JS load ops in load_card
+            'frame_set': 0.1,
+            'element_wait': 3.0, 
+            'js_init': 0.1,
+            'canvas_render_wait': 1.5 # Wait after load_card for canvas to be ready for capture (Increased from TM's 1.0s for safety)
         }
-        
-        # Create download directory if it doesn't exist
+
         Path(self.download_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Set up logging
         self.setup_logging(log_level)
-        self.logger.info(f"Initialized CardConjurerDownloader")
+        self.logger.info(f"Initialized CardConjurerDownloader (Canvas Capture Version)")
         self.logger.info(f"URL: {self.url}")
-        self.logger.info(f"Download directory: {self.download_dir}")
-        
+        self.logger.info(f"Output directory (for ZIP and logs): {self.download_dir}")
+
     def setup_logging(self, log_level):
-        """Set up logging with both file and console handlers."""
-        # Create logs directory
         log_dir = Path(self.download_dir) / "logs"
         log_dir.mkdir(exist_ok=True)
-        
-        # Create logger
         self.logger = logging.getLogger('CardConjurer')
-        self.logger.setLevel(log_level)
-        
-        # Clear any existing handlers
+        self.logger.setLevel(logging.DEBUG) 
         if self.logger.handlers:
             self.logger.handlers.clear()
-        
-        # Create formatters
         detailed_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         )
         simple_formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s'
         )
-        
-        # File handler with detailed formatting
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = log_dir / f"cardconjurer_{timestamp}.log"
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(detailed_formatter)
-        
-        # Console handler with simple formatting
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(log_level)
         console_handler.setFormatter(simple_formatter)
-        
-        # Add handlers to logger
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
-        
         self.logger.info(f"Logging initialized. Log file: {log_file}")
-        
+
     def setup_driver(self, headless=False):
-        """Set up Chrome WebDriver with appropriate options."""
         self.logger.info(f"Setting up Chrome driver (headless={headless})")
-        
         chrome_options = Options()
-        
-        # Set download directory
+        # No need for download directory prefs for image files anymore
         prefs = {
-            "download.default_directory": self.download_dir,
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": False
+            "safebrowsing.enabled": False,
         }
         chrome_options.add_experimental_option("prefs", prefs)
-        
-        # Add other options
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        
-        # Enable browser logging
-        chrome_options.add_argument("--enable-logging")
-        chrome_options.add_argument("--v=1")
-        
+        chrome_options.add_argument("--window-size=1920,1080") # Canvas size can depend on window
+        chrome_options.page_load_strategy = 'eager'
+
         if headless:
-            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--headless=new")
             self.logger.info("Running in headless mode")
-        
-        # Try to find the chromedriver binary
-        chromedriver_paths = [
-            "/usr/bin/chromedriver",  # Debian/Ubuntu default location
-            "/usr/local/bin/chromedriver",
-            "chromedriver"  # In PATH
-        ]
-        
+
+        chromedriver_paths = ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver", "chromedriver"]
         chromedriver_path = None
-        for path in chromedriver_paths:
-            if os.path.exists(path) or os.system(f"which {path} > /dev/null 2>&1") == 0:
-                chromedriver_path = path
-                self.logger.info(f"Found chromedriver at: {path}")
+        for path_attempt in chromedriver_paths:
+            resolved_path = os.path.expanduser(path_attempt)
+            if os.path.exists(resolved_path) or os.system(f"which {resolved_path} > /dev/null 2>&1") == 0:
+                chromedriver_path = resolved_path
+                self.logger.info(f"Found chromedriver at: {chromedriver_path}")
                 break
-        
         if not chromedriver_path:
-            self.logger.error("ChromeDriver not found. Please install chromium-driver package.")
-            raise Exception("ChromeDriver not found. Please install chromium-driver package.")
-        
-        # Initialize driver with service
+            self.logger.error("ChromeDriver not found. Please install chromium-driver or ensure chromedriver is in PATH.")
+            raise Exception("ChromeDriver not found.")
+
         service = Service(chromedriver_path)
-        
-        # Try Chromium first, then Chrome
-        browser_attempts = [
-            ("/usr/bin/chromium", "Chromium"),
-            ("/usr/bin/google-chrome", "Google Chrome"),
-            (None, "Default Chrome/Chromium")
-        ]
-        
-        for binary_path, browser_name in browser_attempts:
-            try:
-                self.logger.info(f"Attempting to start {browser_name}")
-                chrome_options.binary_location = binary_path
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                self.logger.info(f"Successfully started {browser_name}")
-                break
-            except Exception as e:
-                self.logger.warning(f"Failed to start {browser_name}: {e}")
-        
-        if not self.driver:
-            self.logger.error("Failed to initialize any browser")
-            raise Exception("Could not initialize Chrome or Chromium")
-        
-        self.driver.maximize_window()
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.logger.info("Browser setup complete")
-        
+
+    # --- wait_for_element, wait_for_clickable, click_element_safely remain the same ---
     def wait_for_element(self, selector, by=By.CSS_SELECTOR, timeout=None):
-        """Wait for an element to be present and return it."""
         if timeout is None:
             timeout = self.delays['element_wait']
-            
-        self.logger.debug(f"Waiting for element: {selector} (timeout={timeout}s)")
         try:
-            element = WebDriverWait(self.driver, timeout).until(
+            return WebDriverWait(self.driver, timeout).until(
                 EC.presence_of_element_located((by, selector))
             )
-            self.logger.debug(f"Found element: {selector}")
-            return element
         except TimeoutException:
-            self.logger.warning(f"Timeout waiting for element: {selector}")
+            self.logger.debug(f"Timeout waiting for element: {by}='{selector}'")
             return None
-    
+
     def wait_for_clickable(self, selector, by=By.CSS_SELECTOR, timeout=None):
-        """Wait for an element to be clickable and return it."""
         if timeout is None:
             timeout = self.delays['element_wait']
-            
-        self.logger.debug(f"Waiting for clickable element: {selector} (timeout={timeout}s)")
         try:
-            element = WebDriverWait(self.driver, timeout).until(
+            return WebDriverWait(self.driver, timeout).until(
                 EC.element_to_be_clickable((by, selector))
             )
-            self.logger.debug(f"Element is clickable: {selector}")
-            return element
         except TimeoutException:
-            self.logger.warning(f"Timeout waiting for clickable element: {selector}")
+            self.logger.debug(f"Timeout waiting for clickable element: {by}='{selector}'")
             return None
-    
-    def navigate_to_card_conjurer(self):
-        """Navigate to Card Conjurer and wait for it to load."""
-        self.logger.info(f"Navigating to Card Conjurer: {self.url}")
-        
+
+    def click_element_safely(self, element):
         try:
-            self.driver.get(self.url)
-        except Exception as e:
-            self.logger.error(f"Failed to navigate to {self.url}: {e}")
-            raise
-        
-        # Wait for key elements to load
-        self.logger.info("Waiting for Card Conjurer to load...")
-        
-        # Wait for multiple indicators that the page is ready
-        indicators = [
-            "canvas",
-            "#mainCanvas",
-            "#load-card-options",
-            ".download",
-            "[onclick*='toggleCreatorTabs']"  # Tab buttons
-        ]
-        
-        loaded = False
-        for indicator in indicators:
-            element = self.wait_for_element(indicator, timeout=self.delays['page_load'] * 3)
-            if element:
-                self.logger.info(f"Found page indicator: {indicator}")
-                loaded = True
-                break
-        
-        if not loaded:
-            self.logger.warning("Could not verify page is fully loaded")
-        
-        # Give the JavaScript time to initialize (reduced delay)
-        self.logger.info("Waiting for JavaScript initialization...")
-        time.sleep(self.delays['js_init'])
-        
-        # Check which tab we're on
-        try:
-            # Look for visible tab content
-            visible_tabs = self.driver.find_elements(By.CSS_SELECTOR, "[id$='Tab']:not([style*='display: none'])")
-            if visible_tabs:
-                self.logger.info(f"Currently on tab: {visible_tabs[0].get_attribute('id')}")
-        except:
-            pass
-        
-        # Try to wait for download function to be available
-        try:
-            result = self.driver.execute_script("return typeof downloadCard === 'function'")
-            if result:
-                self.logger.info("downloadCard function is available")
-            else:
-                self.logger.warning("downloadCard function not found")
-        except Exception as e:
-            self.logger.warning(f"Error checking for downloadCard function: {e}")
-        
-        # Check for toggleCreatorTabs function
-        try:
-            result = self.driver.execute_script("return typeof toggleCreatorTabs === 'function'")
-            if result:
-                self.logger.info("toggleCreatorTabs function is available")
-            else:
-                self.logger.warning("toggleCreatorTabs function not found")
-        except Exception as e:
-            self.logger.warning(f"Error checking for toggleCreatorTabs function: {e}")
-        
-        return loaded
-    
-    def navigate_to_import_page(self):
-        """Navigate to the import/save tab."""
-        self.logger.info("Navigating to import/save tab...")
-        
-        # Try to find and click the Import/Save tab
-        # Based on the onclick attribute you provided: onclick="toggleCreatorTabs(event, 'import')"
-        tab_selectors = [
-            # Primary selector based on onclick attribute
-            "[onclick*=\"toggleCreatorTabs(event, 'import')\"]",
-            "[onclick*='toggleCreatorTabs'][onclick*='import']",
-            
-            # Secondary selectors
-            "[onclick*='import']",
-            "button[onclick*='import']",
-            "a[onclick*='import']",
-            "div[onclick*='import']",
-            
-            # Text-based selectors
-            "//*[contains(text(), 'Import/Save')]",
-            "//*[contains(text(), 'Import')]",
-            "//*[contains(text(), 'Save')]",
-            
-            # ID/class based
-            "#importTab",
-            ".importTab",
-            ".import-tab",
-            "#import",
-            
-            # Other possible selectors
-            "a[onclick*='tabImportExport']",
-            "button[onclick*='tabImportExport']",
-            "#tabImportExport"
-        ]
-        
-        # Try CSS selectors first
-        for selector in tab_selectors:
-            if selector.startswith("//"):
-                # Skip XPath selectors in this loop
-                continue
-                
-            try:
-                tab = self.wait_for_clickable(selector, timeout=1)
-                if tab:
-                    self.logger.info(f"Found import tab using selector: {selector}")
-                    tab.click()
-                    time.sleep(self.delays['tab_switch'])
-                    return True
-            except Exception as e:
-                self.logger.debug(f"Selector {selector} failed: {e}")
-        
-        # Try XPath selectors
-        for selector in tab_selectors:
-            if not selector.startswith("//"):
-                # Skip CSS selectors in this loop
-                continue
-                
-            try:
-                tab = self.wait_for_clickable(selector, by=By.XPATH, timeout=1)
-                if tab:
-                    self.logger.info(f"Found import tab using XPath: {selector}")
-                    tab.click()
-                    time.sleep(self.delays['tab_switch'])
-                    return True
-            except Exception as e:
-                self.logger.debug(f"XPath {selector} failed: {e}")
-        
-        # Try finding tabs by partial onclick text
-        try:
-            elements = self.driver.find_elements(By.XPATH, "//*[@onclick]")
-            for element in elements:
-                onclick = element.get_attribute("onclick")
-                if onclick and "toggleCreatorTabs" in onclick and "import" in onclick:
-                    self.logger.info(f"Found import tab by onclick attribute: {onclick}")
-                    element.click()
-                    time.sleep(self.delays['tab_switch'])
-                    return True
-        except Exception as e:
-            self.logger.warning(f"Error searching for onclick attributes: {e}")
-        
-        # If we can't find the tab, see if we're already on the import page
-        file_input = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
-        if file_input:
-            self.logger.info("Already on import page")
+            element.click()
             return True
-        
-        # Last resort: try to execute JavaScript directly
-        javascript_attempts = [
-            "toggleCreatorTabs(event, 'import')",
-            "toggleCreatorTabs(null, 'import')",
-            "toggleCreatorTabs({}, 'import')",
-            "tabImportExport()",
-            "openImportTab()"
-        ]
-        
-        for js_code in javascript_attempts:
+        except ElementClickInterceptedException:
+            self.logger.warning("Element click intercepted, trying JS click.")
             try:
-                self.driver.execute_script(js_code)
-                self.logger.info(f"Navigated to import tab using JavaScript: {js_code}")
-                time.sleep(self.delays['tab_switch'])
-                
-                # Check if we're now on the import page
-                file_input = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
-                if file_input:
-                    return True
-            except Exception as e:
-                self.logger.debug(f"JavaScript attempt failed: {js_code} - {e}")
-        
-        self.logger.error("Could not find or navigate to import tab")
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                time.sleep(0.1)
+                self.driver.execute_script("arguments[0].click();", element)
+                return True
+            except Exception as e_js_click:
+                self.logger.error(f"JS click also failed: {e_js_click}")
+                return False
+        except Exception as e_click:
+            self.logger.error(f"Other error clicking element: {e_click}")
+            return False
+    # --- End of unchanged helper methods ---
+
+    def navigate_to_card_conjurer(self):
+        self.logger.info(f"Navigating to Card Conjurer: {self.url}")
+        self.driver.get(self.url)
+        if self.wait_for_element("canvas", timeout=10): # Primary canvas is key
+            self.logger.info("Canvas found, page appears ready.")
+            return True
+        self.logger.error("Canvas not found after page load. Card Conjurer may not have loaded correctly.")
         return False
-    
-    def wait_for_initial_load(self):
-        """Wait for Card Conjurer to fully load and be ready for interaction."""
-        self.logger.info("Waiting for Card Conjurer to be fully loaded...")
-        
-        # Wait for the canvas to be visible
-        canvas = self.wait_for_element("#mainCanvas, canvas", timeout=self.delays['element_wait'])
-        if not canvas:
-            self.logger.warning("Canvas not found during initial load")
-        
-        # Wait for any loading indicators to disappear
-        try:
-            loading_indicators = [".loading", "#loading", ".spinner", "#spinner"]
-            for indicator in loading_indicators:
+
+    def navigate_to_import_page(self):
+        self.logger.info("Navigating to import/save tab...")
+        tab_selector = "h3[onclick*='toggleCreatorTabs(event, \"import\")']"
+        self.logger.debug(f"Attempting to find import tab button with selector: {tab_selector}")
+        import_tab_button = self.wait_for_clickable(tab_selector, timeout=5) 
+        if import_tab_button:
+            if self.click_element_safely(import_tab_button):
+                self.logger.info("Successfully clicked the import tab.")
+                time.sleep(self.delays['tab_switch'] + 0.5) 
+                verification_selector = "input[type='file']" 
+                self.logger.debug(f"Verifying import tab by looking for a visible '{verification_selector}'.")
                 try:
-                    WebDriverWait(self.driver, 2).until(
-                        EC.invisibility_of_element_located((By.CSS_SELECTOR, indicator))
+                    WebDriverWait(self.driver, 7).until(
+                        lambda driver: any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, verification_selector))
                     )
-                except:
-                    pass
-        except:
-            pass
-        
-        # Give JavaScript a moment to initialize (reduced delay)
-        time.sleep(self.delays['js_init'])
-        
-        self.logger.info("Initial load complete")
-    
+                    self.logger.info("Import tab active (verified by visible file input).")
+                    return True
+                except TimeoutException:
+                    self.logger.warning(f"Clicked import tab, but NO visible '{verification_selector}' found.")
+                    return False 
+            else:
+                self.logger.error(f"Failed to click the import tab button ({tab_selector}).")
+                return False
+        else:
+            self.logger.error(f"Import tab button ({tab_selector}) not found or not clickable.")
+            return False
+
     def upload_cardconjurer_file(self, file_path):
-        """Upload a .cardconjurer file."""
         self.logger.info(f"Uploading file: {file_path}")
-        
         if not os.path.exists(file_path):
             self.logger.error(f"File not found: {file_path}")
             return False
-        
-        # Wait for initial load
-        self.wait_for_initial_load()
-        
-        # Navigate to import page
         if not self.navigate_to_import_page():
+            self.logger.error("Failed to navigate to import page for file upload.")
             return False
-        
-        # Find the file input element
-        # Try multiple selectors as the input might be hidden
+
+        self.logger.info("Attempting to find the file input element on the import tab...")
         file_input_selectors = [
-            "input[type='file']",
-            "input[accept*='.cardconjurer']",
-            "#fileInput",
-            "#uploadInput",
-            "#file-upload"
+            "input#importProject[type='file']", 
+            "input[type='file'][accept*='.cardconjurer']", 
+            "input[type='file'][oninput*='uploadSavedCards']",
+            "input[type='file']", 
         ]
-        
-        file_input = None
-        for selector in file_input_selectors:
-            try:
-                # Try both visible and hidden inputs
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                for element in elements:
-                    # Check if this is the right input by looking at its surroundings
-                    try:
-                        parent = element.find_element(By.XPATH, "..")
-                        parent_text = parent.text.lower()
-                        if any(word in parent_text for word in ['upload', 'import', 'load', 'choose file']):
-                            file_input = element
-                            self.logger.info(f"Found file input using selector: {selector}")
-                            break
-                    except:
-                        pass
-                    
-                    # If no context, use the first file input we find
-                    if not file_input and element:
-                        file_input = element
-                
-                if file_input:
-                    break
-            except:
-                continue
-        
-        if not file_input:
-            self.logger.error("Could not find file input element")
+        file_input_element = None
+        for selector_type_pass in ["VISIBLE", "HIDDEN"]: # Two passes
+            for selector in file_input_selectors:
+                self.logger.debug(f"Trying {selector_type_pass} file input selector: {selector}")
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for el in elements:
+                        is_el_displayed = el.is_displayed()
+                        if (selector_type_pass == "VISIBLE" and not is_el_displayed) or \
+                           (selector_type_pass == "HIDDEN" and is_el_displayed):
+                            continue # Skip if not matching current pass's visibility requirement
+
+                        el_accept = el.get_attribute('accept') or ""
+                        el_oninput = el.get_attribute('oninput') or ""
+                        is_specific = ('.cardconjurer' in el_accept or '.txt' in el_accept) or \
+                                      ('uploadSavedCards' in el_oninput)
+                        
+                        if is_specific:
+                            file_input_element = el
+                            self.logger.info(f"Found specific {selector_type_pass} file input: {selector}")
+                            break 
+                        elif not file_input_element: # Take first generic one of the current visibility pass
+                            file_input_element = el
+                            self.logger.info(f"Found generic {selector_type_pass} file input (candidate): {selector}")
+                    if file_input_element and \
+                       ((('.cardconjurer' in (file_input_element.get_attribute('accept') or "") or '.txt' in (file_input_element.get_attribute('accept') or "" )) or \
+                         ('uploadSavedCards' in (file_input_element.get_attribute('oninput') or ""))) and \
+                        (file_input_element.is_displayed() if selector_type_pass == "VISIBLE" else True)): # Check if it's a good specific match for this pass
+                        break 
+                except Exception as e_find:
+                    self.logger.debug(f"Error or no elements for {selector_type_pass} selector {selector}: {e_find}")
+            if file_input_element: break # Found one, stop passes
+
+        if not file_input_element:
+            self.logger.error("Could not find a suitable file input element.")
             return False
-        
-        # Make the input visible if it's hidden (some sites hide the actual input)
+        if not file_input_element.is_displayed():
+             self.logger.warning(f"Using a HIDDEN file input. Attempting to make it visible.")
+
         try:
-            self.driver.execute_script("""
-                arguments[0].style.display = 'block';
-                arguments[0].style.visibility = 'visible';
-                arguments[0].style.opacity = '1';
-            """, file_input)
-        except:
-            pass
-        
-        # Send the file path to the input
-        try:
-            file_input.send_keys(file_path)
-            self.logger.info("File path sent to input element")
+            self.logger.info(f"Using file input: Tag={file_input_element.tag_name}, ID='{file_input_element.get_attribute('id')}', Class='{file_input_element.get_attribute('class')}', Accept='{file_input_element.get_attribute('accept')}', OnInput='{file_input_element.get_attribute('oninput')}'")
+            self.driver.execute_script(
+                "arguments[0].style.opacity=1; arguments[0].style.display='block'; arguments[0].style.visibility='visible'; arguments[0].disabled=false; arguments[0].removeAttribute('hidden');", 
+                file_input_element
+            )
+            time.sleep(0.2) 
+            file_input_element.send_keys(os.path.abspath(file_path)) 
+            self.logger.info(f"File path sent to input element.")
         except Exception as e:
-            self.logger.error(f"Error sending file path: {e}")
+            self.logger.error(f"Error sending file path: {e}", exc_info=True)
             return False
-        
-        # Wait for the upload to process (reduced delay)
-        self.logger.info("Waiting for file to process...")
-        time.sleep(self.delays['file_upload'])
-        
-        # Check if cards were loaded
-        if self.check_cards_loaded():
-            self.logger.info("Cards loaded successfully")
+
+        self.logger.info("Waiting for cards to load from file...")
+        try:
+            WebDriverWait(self.driver, self.delays['file_upload_wait']).until(self.check_cards_loaded)
+            self.logger.info("Cards loaded successfully after file upload.")
             return True
-        
-        # Try to trigger uploadSavedCards manually if needed
-        try:
-            self.driver.execute_script("""
-                var event = {
-                    target: {
-                        files: [new File([''], '%s')]
-                    }
-                };
-                uploadSavedCards(event);
-            """ % os.path.basename(file_path))
-            self.logger.info("Triggered uploadSavedCards function manually")
-            time.sleep(self.delays['file_upload'])
-            return self.check_cards_loaded()
-        except Exception as e:
-            self.logger.warning(f"Could not trigger uploadSavedCards manually: {e}")
-        
-        return False
-    
-    def check_cards_loaded(self):
-        """Check if cards have been loaded."""
-        # Check the card dropdown
-        try:
-            card_select = self.driver.find_element(By.ID, "load-card-options")
-            options = card_select.find_elements(By.TAG_NAME, "option")
-            
-            # Filter out empty options
-            valid_options = [opt for opt in options if opt.text.strip()]
-            
-            if len(valid_options) > 0:
-                self.logger.info(f"Found {len(valid_options)} cards in dropdown")
-                return True
-        except:
-            pass
-        
-        # Check if any cards are visible in the UI
-        try:
-            cards_in_list = self.driver.find_elements(By.CSS_SELECTOR, ".card-in-list, .saved-card")
-            if cards_in_list:
-                self.logger.info(f"Found {len(cards_in_list)} cards in list")
-                return True
-        except:
-            pass
-        
-        self.logger.warning("No cards found after upload")
-        return False
-    
-    def get_saved_cards(self):
-        """Get list of saved cards from the dropdown."""
-        self.logger.info("Getting list of saved cards...")
-        
-        # Try multiple selectors for the card list
-        selectors = [
-            "#load-card-options",
-            "select[onchange*='loadCard']",
-            "select[id*='load-card']"
-        ]
-        
-        card_select = None
-        for selector in selectors:
-            card_select = self.wait_for_element(selector, timeout=2)
-            if card_select:
-                self.logger.info(f"Found card list using selector: {selector}")
-                break
-        
-        if not card_select:
-            self.logger.error("Could not find card list dropdown")
-            return []
-        
-        # Get all options
-        try:
-            options = card_select.find_elements(By.TAG_NAME, "option")
-            self.logger.info(f"Found {len(options)} options in dropdown")
-        except Exception as e:
-            self.logger.error(f"Error getting options: {e}")
-            return []
-        
-        # Filter out empty/default options
-        cards = []
-        for i, option in enumerate(options):
+        except TimeoutException: # Remainder of this try-except is for debugging upload failure
+            self.logger.error("Timeout waiting for cards to load after file upload.")
             try:
-                card_name = option.text.strip() or option.get_attribute("value")
-                if card_name and card_name != "Load a saved card":  # Skip placeholder text
-                    cards.append(card_name)
-                    self.logger.debug(f"Card {i}: {card_name}")
-            except Exception as e:
-                self.logger.warning(f"Error processing option {i}: {e}")
+                card_select_dbg = self.driver.find_element(By.ID, "load-card-options")
+                options_dbg = card_select_dbg.find_elements(By.TAG_NAME, "option")
+                valid_options_dbg = [opt.text for opt in options_dbg if opt.text.strip() and opt.text.strip().lower() not in ['none selected', 'load a saved card', '']]
+                self.logger.info(f"Debug: Found {len(valid_options_dbg)} cards in dropdown during fail: {valid_options_dbg[:5]}")
+            except: self.logger.info("Debug: Could not get card options for debugging during fail.")
+            try:
+                if self.driver.execute_script("return typeof uploadSavedCards === 'function';"):
+                    self.logger.info("'uploadSavedCards' function EXISTS. Failure might be due to event not triggering this handler.")
+                else: self.logger.info("'uploadSavedCards' function does NOT exist.") 
+            except Exception as e_js_check_upload: self.logger.warning(f"Error checking for 'uploadSavedCards' JS function: {e_js_check_upload}")
+            return False
+
+    def check_cards_loaded(self, driver_instance=None): # driver_instance for WebDriverWait lambda if needed
+        # This method is used as a callable for WebDriverWait
+        driver_to_use = driver_instance if driver_instance else self.driver
+        try:
+            card_select = driver_to_use.find_element(By.ID, "load-card-options")
+            options = card_select.find_elements(By.TAG_NAME, "option")
+            valid_options = [opt for opt in options if opt.text.strip() and opt.text.strip().lower() not in ['none selected', 'load a saved card', '']]
+            if len(valid_options) > 0:
+                self.logger.debug(f"check_cards_loaded: Found {len(valid_options)} cards.")
+                return True
+        except NoSuchElementException:
+            self.logger.debug("check_cards_loaded: 'load-card-options' not found.")
+        except Exception as e:
+            self.logger.debug(f"check_cards_loaded: Error checking cards: {e}")
+        return False
         
-        self.logger.info(f"Found {len(cards)} saved cards")
-        self.cards = cards
-        return cards
-    
-    def set_auto_frame(self, frame_option):
-        """Set the auto frame dropdown value."""
-        if not frame_option:
-            return True  # No frame specified, nothing to do
-            
+    def get_saved_cards(self): # Remains largely the same
+        self.logger.info("Getting list of saved cards...")
+        try:
+            card_select = self.wait_for_element("load-card-options", by=By.ID, timeout=5)
+            if not card_select:
+                self.logger.error("'load-card-options' select element not found.")
+                self.cards = []
+                return []
+            options = card_select.find_elements(By.TAG_NAME, "option")
+            cards_found = []
+            for option in options:
+                card_name = option.get_attribute("value").strip() 
+                if card_name and card_name.lower() not in ['none selected', 'load a saved card', '']:
+                    cards_found.append(card_name)
+            self.logger.info(f"Found {len(cards_found)} saved cards: {cards_found[:5] if cards_found else 'None'}") 
+            self.cards = cards_found
+            return cards_found
+        except Exception as e:
+            self.logger.error(f"Error getting saved cards: {e}")
+            self.cards = []
+            return []
+
+    def set_auto_frame(self, frame_option): # Remains the same
+        if not frame_option: return True
         self.logger.info(f"Setting auto frame to: {frame_option}")
-        
-        # Mapping from script options to dropdown values
-        frame_mapping = {
-            '7th': 'Seventh',
-            'seventh': 'Seventh',
-            '8th': '8th',
-            'eighth': '8th',
-            'm15': 'M15Eighth',
-            'ub': 'M15EighthUB'
-        }
-        
+        frame_mapping = {'7th': 'Seventh', 'seventh': 'Seventh', '8th': 'Eighth', 'eighth': 'Eighth', 'm15': 'M15Eighth', 'ub': 'M15EighthUB'}
         dropdown_value = frame_mapping.get(frame_option.lower())
         if not dropdown_value:
-            self.logger.error(f"Invalid frame option: {frame_option}")
+            self.logger.error(f"Invalid frame option: {frame_option}.")
             return False
-        
-        self.logger.info(f"Mapped '{frame_option}' to dropdown value: '{dropdown_value}'")
-        
-        # Find the auto frame dropdown
-        dropdown_selectors = [
-            "#autoFrame",
-            "select#autoFrame",
-            "[id='autoFrame']",
-            "select[onchange*='setAutoFrame']"
-        ]
-        
-        dropdown = None
-        for selector in dropdown_selectors:
-            try:
-                dropdown = self.wait_for_element(selector, timeout=2)
-                if dropdown:
-                    self.logger.info(f"Found auto frame dropdown using selector: {selector}")
-                    break
-            except:
-                continue
-        
-        if not dropdown:
-            self.logger.error("Could not find auto frame dropdown")
-            return False
-        
-        # Set the dropdown value
         try:
-            # Use JavaScript to set the value
-            self.driver.execute_script(f"""
-                var select = arguments[0];
-                select.value = '{dropdown_value}';
-                // Trigger change event
-                var event = new Event('change', {{ bubbles: true }});
-                select.dispatchEvent(event);
-            """, dropdown)
-            
-            self.logger.info(f"Set auto frame dropdown to: {dropdown_value}")
-            
-            # Also try to call the onChange function directly
+            select_element = self.wait_for_element("autoFrame", by=By.ID, timeout=5)
+            if not select_element: return False
+            Select(select_element).select_by_value(dropdown_value)
+            self.logger.info(f"Successfully set auto frame to '{dropdown_value}' using Selenium Select.")
+            time.sleep(self.delays['frame_set'] + 0.5)
+            return True
+        except Exception as e: # Fallback to JS
+            self.logger.warning(f"Selenium Select for auto frame failed: {e}. Trying JS.")
             try:
-                self.driver.execute_script("setAutoFrame()")
-                self.logger.info("Called setAutoFrame() function")
-            except:
-                pass
-            
-            # Wait a moment for the change to take effect (reduced delay)
-            time.sleep(self.delays['frame_set'])
-            
-            # Verify the value was set
-            current_value = dropdown.get_attribute('value')
-            if current_value == dropdown_value:
-                self.logger.info(f"Successfully verified auto frame is set to: {current_value}")
+                self.driver.execute_script(f"var s=document.getElementById('autoFrame'); s.value='{dropdown_value}'; s.dispatchEvent(new Event('change',{{'bubbles':true}}));")
+                self.logger.info(f"Set auto frame via JS fallback.")
+                time.sleep(self.delays['frame_set'] + 0.5)
                 return True
+            except Exception as e_js:
+                self.logger.error(f"JS fallback for auto frame also failed: {e_js}")
+                return False
+
+    def load_card(self, card_name: str): # Remains the same as last successful version
+        self.logger.info(f"Loading card: '{card_name}' using JavaScript method.")
+        try:
+            if not self.wait_for_element("load-card-options", By.ID, timeout=3): return False
+            js_escaped_card_name = json.dumps(card_name)
+            start_time = time.perf_counter()
+            self.driver.execute_script(f"document.getElementById('load-card-options').value = {js_escaped_card_name};")
+            self.logger.debug(f"JS: Set value took {time.perf_counter() - start_time:.4f}s")
+            start_time = time.perf_counter()
+            self.driver.execute_script(f"var s=document.getElementById('load-card-options'); s.dispatchEvent(new Event('change',{{'bubbles':true}}));")
+            change_event_duration = time.perf_counter() - start_time
+            self.logger.debug(f"JS: Dispatch 'change' event took {change_event_duration:.4f}s")
+            if change_event_duration < 1.0 and self.driver.execute_script("return typeof loadCard === 'function';"):
+                start_time = time.perf_counter()
+                self.driver.execute_script(f"loadCard({js_escaped_card_name});")
+                self.logger.debug(f"JS: Global loadCard() call took {time.perf_counter() - start_time:.4f}s")
+            elif change_event_duration >= 1.0 : self.logger.info(f"JS: Dispatch 'change' was slow ({change_event_duration:.4f}s), assumed load handled.")
+            time.sleep(self.delays['card_load_js_ops']) 
+            self.logger.info(f"JS operations for card load '{card_name}' completed.")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error loading card '{card_name}': {e}", exc_info=True)
+            return False
+
+    def capture_card_image_data_from_canvas(self, card_name: str) -> Optional[bytes]:
+        """Captures the current card image from the main canvas and returns image bytes."""
+        self.logger.info(f"Preparing to capture canvas for: {card_name}")
+        
+        # Wait for canvas to render after load_card operations
+        time.sleep(self.delays['canvas_render_wait'])
+        self.logger.debug(f"Waited {self.delays['canvas_render_wait']}s for canvas render of '{card_name}'.")
+
+        js_get_data_url = """
+            const canvasSelectors = ['#mainCanvas', '#canvas', 'canvas']; // Try known selectors
+            let canvas = null;
+            for (let selector of canvasSelectors) {
+                canvas = document.querySelector(selector);
+                if (canvas) break;
+            }
+            if (!canvas) {
+                console.error('CardConjurer Automation: Canvas element not found for capture.');
+                return null;
+            }
+            try {
+                // Check if canvas has non-zero dimensions
+                if (canvas.width === 0 || canvas.height === 0) {
+                    console.warn('CardConjurer Automation: Canvas has zero dimensions. Capture might be blank.');
+                   // return null; // Optionally return null if zero dimensions is an error
+                }
+                return canvas.toDataURL('image/png');
+            } catch (e) {
+                console.error('CardConjurer Automation: Error calling toDataURL on canvas:', e);
+                return null;
+            }
+        """
+        try:
+            self.logger.debug(f"Executing JS to get canvas data URL for '{card_name}'.")
+            start_time = time.perf_counter()
+            data_url = self.driver.execute_script(js_get_data_url)
+            self.logger.debug(f"JS for canvas data URL took {time.perf_counter() - start_time:.4f}s.")
+
+            if data_url and data_url.startswith('data:image/png;base64,'):
+                base64_data = data_url.split(',', 1)[1]
+                image_bytes = base64.b64decode(base64_data)
+                if len(image_bytes) < 1024 : # Basic sanity check for very small/empty image
+                    self.logger.warning(f"Captured image for '{card_name}' is very small ({len(image_bytes)} bytes). May be blank or error.")
+                else:
+                    self.logger.info(f"Successfully captured canvas image data for '{card_name}' ({len(image_bytes)} bytes).")
+                return image_bytes
             else:
-                self.logger.warning(f"Auto frame value mismatch. Expected: {dropdown_value}, Got: {current_value}")
-                
-        except Exception as e:
-            self.logger.error(f"Error setting auto frame dropdown: {e}")
-            return False
-        
-        return True
-    
-    def load_card(self, card_name):
-        """Load a specific card by name."""
-        self.logger.info(f"Loading card: {card_name}")
-        
-        try:
-            # Find the select element
-            card_select = self.driver.find_element(By.ID, "load-card-options")
-            
-            # Set the select value
-            self.driver.execute_script(f"""
-                var select = document.getElementById('load-card-options');
-                select.value = '{card_name}';
-            """)
-            self.logger.debug("Set select value")
-            
-            # Trigger the change event
-            self.driver.execute_script("""
-                var select = document.getElementById('load-card-options');
-                var event = new Event('change', { bubbles: true });
-                select.dispatchEvent(event);
-            """)
-            self.logger.debug("Triggered change event")
-            
-            # Try to call loadCard directly
-            try:
-                self.driver.execute_script(f"loadCard('{card_name}')")
-                self.logger.debug("Called loadCard function directly")
-            except Exception as e:
-                self.logger.debug(f"Could not call loadCard directly: {e}")
-            
-        except Exception as e:
-            self.logger.error(f"Error loading card '{card_name}': {e}")
-            return False
-        
-        # Wait for card to load (reduced delay)
-        self.logger.debug("Waiting for card to load...")
-        time.sleep(self.delays['card_load'])
-        return True
-    
-    def download_card_with_button(self, card_name):
-        """Download card using the 'Download your card' button."""
-        self.logger.info(f"Downloading card using button: {card_name}")
-        
-        # Try to find the download button
-        download_selectors = [
-            # Primary selector based on onclick
-            "[onclick=\"downloadCard();\"]",
-            "[onclick='downloadCard();']",
-            "[onclick*='downloadCard()']",
-            
-            # Text-based selectors
-            "//*[contains(text(), 'Download your card')]",
-            "//*[contains(text(), 'Download')][@onclick]",
-            
-            # Class-based selectors
-            ".download[onclick*='downloadCard']",
-            "h3.download",
-            ".download.padding",
-            
-            # Generic download button selectors
-            "[onclick*='downloadCard']",
-            ".download-button",
-            "#downloadButton"
-        ]
-        
-        download_button = None
-        
-        # Try CSS selectors first
-        for selector in download_selectors:
-            if selector.startswith("//"):
-                continue
-                
-            try:
-                button = self.wait_for_clickable(selector, timeout=1)
-                if button:
-                    self.logger.info(f"Found download button using selector: {selector}")
-                    download_button = button
-                    break
-            except Exception as e:
-                self.logger.debug(f"Selector {selector} failed: {e}")
-        
-        # Try XPath selectors if CSS didn't work
-        if not download_button:
-            for selector in download_selectors:
-                if not selector.startswith("//"):
-                    continue
-                    
-                try:
-                    button = self.wait_for_clickable(selector, by=By.XPATH, timeout=1)
-                    if button:
-                        self.logger.info(f"Found download button using XPath: {selector}")
-                        download_button = button
-                        break
-                except Exception as e:
-                    self.logger.debug(f"XPath {selector} failed: {e}")
-        
-        # Try finding elements with downloadCard in onclick
-        if not download_button:
-            try:
-                elements = self.driver.find_elements(By.XPATH, "//*[@onclick]")
-                for element in elements:
-                    onclick = element.get_attribute("onclick")
-                    if onclick and "downloadCard" in onclick:
-                        self.logger.info(f"Found download button by onclick: {onclick}")
-                        download_button = element
-                        break
-            except Exception as e:
-                self.logger.warning(f"Error searching for onclick attributes: {e}")
-        
-        if not download_button:
-            self.logger.error("Could not find download button")
-            return None
-        
-        # Get list of existing files in download directory
-        existing_files = set()
-        if os.path.exists(self.download_dir):
-            existing_files = set(os.listdir(self.download_dir))
-        
-        # Click the download button
-        try:
-            download_button.click()
-            self.logger.info("Clicked download button")
-        except Exception as e:
-            self.logger.error(f"Error clicking download button: {e}")
-            # Try JavaScript click as fallback
-            try:
-                self.driver.execute_script("arguments[0].click();", download_button)
-                self.logger.info("Clicked download button using JavaScript")
-            except Exception as e2:
-                self.logger.error(f"JavaScript click also failed: {e2}")
+                self.logger.error(f"Failed to get valid image data URL from canvas for '{card_name}'. Received: {str(data_url)[:100]}")
+                # Log any console messages from the browser if possible (requires specific setup)
+                # For now, rely on the JS console.error messages.
                 return None
-        
-        # Wait for download to complete (reduced timeout)
-        self.logger.info("Waiting for download to complete...")
-        
-        # Wait for a new file to appear
-        downloaded_file = None
-        max_wait_time = self.delays['download_wait']
-        wait_interval = 0.2  # Reduced from 0.5
-        elapsed_time = 0
-        
-        while elapsed_time < max_wait_time:
-            time.sleep(wait_interval)
-            elapsed_time += wait_interval
-            
-            current_files = set(os.listdir(self.download_dir))
-            new_files = current_files - existing_files
-            
-            if new_files:
-                # Found new file(s)
-                for filename in new_files:
-                    if filename.endswith('.png') or filename.endswith('.jpg') or filename.endswith('.jpeg'):
-                        downloaded_file = os.path.join(self.download_dir, filename)
-                        self.logger.info(f"Found downloaded file: {filename}")
-                        break
-                
-                if downloaded_file and os.path.exists(downloaded_file):
-                    # Wait a brief moment to ensure download is complete
-                    time.sleep(0.3)
-                    # Check if file size is stable
-                    size1 = os.path.getsize(downloaded_file)
-                    time.sleep(0.2)
-                    size2 = os.path.getsize(downloaded_file)
-                    
-                    if size1 == size2 and size1 > 0:
-                        self.logger.info(f"Download complete: {downloaded_file}")
-                        return downloaded_file
-        
-        self.logger.error(f"Download did not complete within {max_wait_time} seconds")
-        return None
-    
+        except Exception as e:
+            self.logger.error(f"Error capturing canvas image for '{card_name}': {e}", exc_info=True)
+            return None
+
     def create_zip_of_all_cards(self):
-        """Create a ZIP file containing all cards."""
-        self.logger.info("Starting ZIP creation process")
-        
+        self.logger.info("Starting ZIP creation process (Canvas Capture Method)")
         if not self.cards:
-            self.logger.info("No cards list available, fetching from page...")
+            self.logger.info("Card list is empty, fetching from page...")
+            if not (self.driver.current_url.endswith("#import") or self.navigate_to_import_page()):
+                self.logger.warning("Could not navigate to import page to get saved cards.")
             self.get_saved_cards()
         
         if not self.cards:
-            self.logger.error("No cards found to download")
+            self.logger.error("No cards found to process for ZIP file.")
             return None
         
-        # Create ZIP file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_filename = os.path.join(self.download_dir, f"CardConjurer_Cards_{timestamp}.zip")
-        self.logger.info(f"Creating ZIP file: {zip_filename}")
+        zip_filename_path = Path(self.download_dir) / f"CardConjurer_Canvas_Cards_{timestamp}.zip"
+        self.logger.info(f"Creating ZIP file: {zip_filename_path}")
         
         successful_cards = 0
         failed_cards = []
-        temp_files = []  # Keep track of downloaded files to clean up
         
         try:
-            with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            with zipfile.ZipFile(zip_filename_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for i, card_name in enumerate(self.cards):
-                    self.logger.info(f"Processing card {i+1}/{len(self.cards)}: {card_name}")
+                    self.logger.info(f"Processing card {i+1}/{len(self.cards)}: '{card_name}'")
                     
-                    # Load the card
                     if not self.load_card(card_name):
-                        self.logger.error(f"Failed to load card: {card_name}")
-                        failed_cards.append(card_name)
+                        self.logger.warning(f"Failed to load card: {card_name}")
+                        failed_cards.append(f"{card_name} (load failed)")
                         continue
                     
-                    # Download the card using the button
-                    downloaded_file = self.download_card_with_button(card_name)
+                    image_bytes = self.capture_card_image_data_from_canvas(card_name)
                     
-                    if downloaded_file and os.path.exists(downloaded_file):
-                        # Add to ZIP with sanitized name
-                        sanitized_name = "".join(c for c in card_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                    if image_bytes:
+                        sanitized_arcname = "".join(c for c in card_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                        # Default to .png as that's what toDataURL('image/png') produces
+                        archive_filename = f"{sanitized_arcname}.png" 
                         
-                        # Get file extension from downloaded file
-                        _, ext = os.path.splitext(downloaded_file)
-                        if not ext:
-                            ext = '.png'  # Default to PNG
-                        
-                        zip_filename_in_archive = f"{sanitized_name}{ext}"
-                        
-                        # Add file to ZIP
-                        zipf.write(downloaded_file, arcname=zip_filename_in_archive)
-                        self.logger.info(f"Added {zip_filename_in_archive} to ZIP")
+                        zipf.writestr(archive_filename, image_bytes)
+                        self.logger.info(f"Added '{archive_filename}' to ZIP from canvas data.")
                         successful_cards += 1
-                        
-                        # Add to temp files list for cleanup
-                        temp_files.append(downloaded_file)
                     else:
-                        self.logger.error(f"Failed to download card: {card_name}")
-                        failed_cards.append(card_name)
-        
+                        self.logger.warning(f"Failed to capture image data for card: {card_name}")
+                        failed_cards.append(f"{card_name} (capture failed)")
         except Exception as e:
-            self.logger.error(f"Error creating ZIP file: {e}")
+            self.logger.error(f"Error during ZIP file creation: {e}", exc_info=True)
+            if os.path.exists(zip_filename_path): os.remove(zip_filename_path) # Clean up partial zip
             return None
         
-        finally:
-            # Clean up temporary downloaded files
-            for temp_file in temp_files:
-                try:
-                    os.remove(temp_file)
-                    self.logger.debug(f"Removed temporary file: {temp_file}")
-                except Exception as e:
-                    self.logger.warning(f"Could not remove temporary file {temp_file}: {e}")
-        
-        # Log summary
-        self.logger.info(f"ZIP creation complete")
-        self.logger.info(f"Successfully processed: {successful_cards}/{len(self.cards)} cards")
+        self.logger.info(f"ZIP creation summary: Successfully processed {successful_cards}/{len(self.cards)} cards.")
         if failed_cards:
-            self.logger.warning(f"Failed cards: {', '.join(failed_cards)}")
+            self.logger.warning(f"Failed cards ({len(failed_cards)}): {', '.join(failed_cards)}")
         
-        self.logger.info(f"ZIP file created: {zip_filename}")
-        return zip_filename
-    
-    def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None, optimize_delays=True):
-        """Run the downloader with specified action."""
-        self.logger.info(f"Starting run with action: {action}, headless: {headless}, frame: {frame}")
-        
-        # Apply optimization if requested
-        if optimize_delays:
-            # These are even more aggressive optimizations
-            self.delays = {
-                'page_load': 0.5,
-                'tab_switch': 0.2,
-                'file_upload': 0.5,
-                'card_load': 0.3,
-                'frame_set': 0.2,
-                'download_wait': 3.0,
-                'element_wait': 3.0,
-                'js_init': 0.5
-            }
-            self.logger.info("Using optimized delays for faster operation")
-        
+        return str(zip_filename_path) if successful_cards > 0 else None
+
+    def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None): # action arg retained for structure
+        self.logger.info(f"Starting run (Canvas Capture) with action: {action}, headless: {headless}, frame: {frame}")
         try:
-            # Setup driver
             self.setup_driver(headless=headless)
-            
-            # Navigate to Card Conjurer
-            if not self.navigate_to_card_conjurer():
-                self.logger.error("Failed to load Card Conjurer properly")
+            if not self.navigate_to_card_conjurer(): return
+            time.sleep(self.delays['js_init'])
+            if frame and not self.set_auto_frame(frame):
+                self.logger.warning(f"Failed to set auto frame to '{frame}'. Continuing...")
+            if cardconjurer_file and not self.upload_cardconjurer_file(cardconjurer_file):
+                self.logger.error(f"Failed to upload/load cards from file: {cardconjurer_file}. Aborting.")
                 return
-            
-            # Set frame option if specified (before uploading file)
-            if frame:
-                if not self.set_auto_frame(frame):
-                    self.logger.warning("Failed to set auto frame, continuing anyway...")
-            
-            # Upload file if provided
-            if cardconjurer_file:
-                if not self.upload_cardconjurer_file(cardconjurer_file):
-                    self.logger.error(f"Failed to upload file: {cardconjurer_file}")
-                    return
-            
-            # Perform requested action
-            self.logger.info(f"Performing action: {action}")
-            
+            # If no file, check for existing cards
+            elif not cardconjurer_file:
+                self.logger.info("No .cardconjurer file provided. Checking for already loaded cards...")
+                on_import = "#import" in self.driver.current_url or self.navigate_to_import_page()
+                if on_import and not self.check_cards_loaded(): self.logger.warning("No cards loaded (checked dropdown).")
+                elif not on_import: self.logger.warning("Cannot check loaded cards, import page nav failed.")
+
             if action == "zip":
-                result = self.create_zip_of_all_cards()
-                if result:
-                    self.logger.info(f"Successfully created ZIP: {result}")
-            else:
-                self.logger.error(f"Unknown action: {action}")
+                if not self.cards: self.get_saved_cards() # get_saved_cards handles nav if needed
+                if not self.cards:
+                    self.logger.error("No cards available to zip.")
+                    return
+                result_zip_path = self.create_zip_of_all_cards()
+                if result_zip_path: self.logger.info(f"Successfully created ZIP: {result_zip_path}")
+                else: self.logger.error("Failed to create ZIP file or ZIP is empty.")
             
         except Exception as e:
-            self.logger.error(f"Error during execution: {e}")
-            self.logger.exception("Full traceback:")
-            raise
-        
+            self.logger.error(f"Unhandled error during execution: {e}", exc_info=True)
         finally:
-            # Close browser
             if self.driver:
-                if not headless:
-                    input("\nPress Enter to close the browser...")
-                self.logger.info("Closing browser")
+                if not headless and sys.stdin.isatty():
+                    try: input("\nPress Enter to close the browser...")
+                    except EOFError: self.logger.info("Non-interactive, closing browser.")
                 self.driver.quit()
-                self.logger.info("Browser closed")
+                self.logger.info("Browser closed.")
 
 
 def main():
-    """Main entry point for the script."""
-    parser = argparse.ArgumentParser(description='Card Conjurer Downloader')
-    parser.add_argument('--file', '-f', required=True,
-                        help='Path to .cardconjurer file to load')
-    parser.add_argument('--url', default='http://mtgproxy:4242',
-                        help='Card Conjurer URL')
-    parser.add_argument('--output', default=None,
-                        help='Output directory')
-    parser.add_argument('--headless', action='store_true',
-                        help='Run in headless mode')
-    parser.add_argument('--action', default='zip',
-                        choices=['zip'],
-                        help='Action to perform (currently only zip is supported)')
-    parser.add_argument('--frame', 
-                        choices=['7th', 'seventh', '8th', 'eighth', 'm15', 'ub'],
-                        help='Auto frame setting to use')
-    parser.add_argument('--slow', action='store_true',
-                        help='Use slower, more conservative delays')
+    parser = argparse.ArgumentParser(description='Card Conjurer Downloader - Canvas Capture Version')
+    parser.add_argument('--file', '-f', required=True, help='Path to .cardconjurer file to load')
+    parser.add_argument('--url', default='http://mtgproxy:4242', help='Card Conjurer URL')
+    parser.add_argument('--output', default=None, help='Output directory for ZIP and logs')
+    parser.add_argument('--headless', action='store_true', help='Run in headless mode')
+    parser.add_argument('--frame', choices=['7th', 'seventh', '8th', 'eighth', 'm15', 'ub'], help='Auto frame setting')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Console logging level')
     
     args = parser.parse_args()
-    
-    # Validate file exists
     if not os.path.exists(args.file):
-        print(f"Error: File not found: {args.file}")
-        sys.exit(1)
+        print(f"Error: File not found: {args.file}"); sys.exit(1)
     
-    # Create downloader
-    downloader = CardConjurerDownloader(url=args.url, download_dir=args.output)
-    
-    # Run the downloader
-    downloader.run(
-        cardconjurer_file=args.file,
-        action=args.action,
-        headless=args.headless,
-        frame=args.frame,
-        optimize_delays=not args.slow
-    )
-
+    log_level_val = getattr(logging, args.log_level.upper(), logging.INFO)
+    downloader = CardConjurerDownloader(url=args.url, download_dir=args.output, log_level=log_level_val)
+    downloader.run(cardconjurer_file=args.file, headless=args.headless, frame=args.frame)
 
 if __name__ == "__main__":
     main()
