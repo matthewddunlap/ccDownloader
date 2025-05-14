@@ -1,12 +1,11 @@
 """
-Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v6.7 - SyntaxFix for ZIP cleanup)
+Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v6.9 - Enhanced Priming for Flavor Text)
 
-Captures card images directly from the canvas using toDataURL, temporarily zips them,
-then extracts to output directory and deletes the ZIP.
+Captures card images directly from the canvas using toDataURL and zips them.
 Uses a smart wait to detect canvas changes and stabilization.
 Includes:
 - Runs in Incognito mode for a clean slate each time.
-- Post-upload: Workaround for first card rendering quirk.
+- Enhanced post-upload priming: handles general first card quirk and {flavor} text rendering.
 - Optional features for art and set symbol manipulation.
 - Set Symbol Override now always uses live rarity, populating separate fields.
 """
@@ -22,7 +21,7 @@ from pathlib import Path
 import zipfile
 import base64 
 import hashlib 
-from typing import Optional, Tuple 
+from typing import Optional, Tuple, Dict # Added Dict
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -37,7 +36,8 @@ class CardConjurerDownloader:
         self.url = url
         self.download_dir = download_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
         self.driver = None
-        self.cards = []
+        self.cards = [] # List of card names from the dropdown
+        self.parsed_card_data_map: Dict[str, Dict] = {} # cardName -> cardObject (inner "data" part)
         self._current_active_tab: Optional[str] = None 
 
         self.auto_fit_art_enabled = False
@@ -55,7 +55,7 @@ class CardConjurerDownloader:
 
         Path(self.download_dir).mkdir(parents=True, exist_ok=True)
         self.setup_logging(log_level)
-        self.logger.info(f"Initialized CC Downloader (Smart Canvas v6.7 - SyntaxFix)")
+        self.logger.info(f"Initialized CC Downloader (Smart Canvas v6.9 - Enhanced Priming)")
         self.logger.info(f"URL: {self.url}")
         self.logger.info(f"Output directory: {self.download_dir}")
 
@@ -68,7 +68,7 @@ class CardConjurerDownloader:
         dt_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         s_fmt = '%(asctime)s - %(levelname)s - %(message)s'
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_fn = log_dir / f"cc_v6.7_syntaxfix_{ts}.log"
+        log_fn = log_dir / f"cc_v6.9_enhanced_prime_{ts}.log"
         fh = logging.FileHandler(log_fn); fh.setLevel(logging.DEBUG); fh.setFormatter(logging.Formatter(dt_fmt))
         ch = logging.StreamHandler(sys.stdout); ch.setLevel(log_level); ch.setFormatter(logging.Formatter(s_fmt))
         self.logger.addHandler(fh); self.logger.addHandler(ch)
@@ -128,6 +128,44 @@ class CardConjurerDownloader:
         if self.wait_for_element("canvas",timeout=10):
             self.logger.info("Canvas found, page ready."); self._current_active_tab="art"; return True 
         self.logger.error("Canvas not found."); return False
+
+    def _parse_cardconjurer_file_content(self, file_path: str) -> bool:
+        self.logger.info(f"Parsing .cardconjurer file content from: {file_path}")
+        self.parsed_card_data_map.clear()
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                full_data_from_file = json.load(f) 
+            
+            card_list_to_parse = []
+            if isinstance(full_data_from_file, list):
+                card_list_to_parse = full_data_from_file
+            elif isinstance(full_data_from_file, dict) and "key" in full_data_from_file: # Handle case where file is single card obj
+                card_list_to_parse = [full_data_from_file]
+            else:
+                self.logger.error(f"Unsupported .cardconjurer structure in {file_path}. Expected a JSON list of card objects or a single card object with a 'key'.")
+                return False
+
+            name_key_in_file = "key" # As per example, this is the main card identifier
+
+            for card_obj_wrapper in card_list_to_parse:
+                if not isinstance(card_obj_wrapper, dict):
+                    self.logger.warning(f"Skipping non-dict item in card list: {str(card_obj_wrapper)[:100]}")
+                    continue
+                if name_key_in_file in card_obj_wrapper:
+                    card_name_val = card_obj_wrapper[name_key_in_file]
+                    if "data" in card_obj_wrapper and isinstance(card_obj_wrapper["data"], dict):
+                        self.parsed_card_data_map[card_name_val] = card_obj_wrapper["data"]
+                    else:
+                        self.logger.warning(f"Card '{card_name_val}' in {file_path} is missing 'data' block or 'data' is not a dict.")
+                else:
+                    self.logger.warning(f"Card object in {file_path} missing '{name_key_in_file}'. Cannot map for data access. Object: {str(card_obj_wrapper)[:100]}")
+            
+            self.logger.info(f"Parsed and mapped data for {len(self.parsed_card_data_map)} card objects from file.")
+            return True
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON decode error parsing {file_path}: {e}"); return False
+        except Exception as e:
+            self.logger.error(f"Error reading/parsing {file_path}: {e}", exc_info=True); return False
 
     def upload_cardconjurer_file(self, file_path: str) -> bool:
         self.logger.info(f"Starting file upload process for: {file_path}")
@@ -218,8 +256,9 @@ class CardConjurerDownloader:
             card_select = self.wait_for_element("load-card-options", by=By.ID, timeout=5)
             if not card_select: self.logger.error("'load-card-options' select element not found."); return []
             options = card_select.find_elements(By.TAG_NAME, "option")
+            # The 'value' attribute of the options is what load_card uses.
             cards_found = [opt.get_attribute("value").strip() for opt in options if opt.get_attribute("value").strip() and opt.get_attribute("value").strip().lower() not in ['none selected', 'load a saved card', '']]
-            self.logger.info(f"Found {len(cards_found)} saved cards: {cards_found[:5] if cards_found else 'None'}") 
+            self.logger.info(f"Found {len(cards_found)} saved cards (dropdown values): {cards_found[:5] if cards_found else 'None'}") 
             self.cards = cards_found; return cards_found
         except Exception as e: self.logger.error(f"Error getting saved cards: {e}", exc_info=True); return []
 
@@ -248,10 +287,11 @@ class CardConjurerDownloader:
 
     def load_card(self, card_name: str) -> bool:
         self.logger.info(f"Loading card: '{card_name}' using JavaScript method.")
+        # Assumes 'import' tab is active.
         try:
             card_select_el = self.wait_for_element("load-card-options", By.ID, timeout=3)
             if not card_select_el: self.logger.error("'load-card-options' not found."); return False
-            js_card = json.dumps(card_name)
+            js_card = json.dumps(card_name) # card_name is from option.value, should be safe
             t=time.perf_counter(); self.driver.execute_script(f"document.getElementById('load-card-options').value = {js_card};"); self.logger.debug(f"JS: Set value took {time.perf_counter() - t:.4f}s")
             t=time.perf_counter(); self.driver.execute_script(f"var s=document.getElementById('load-card-options'); s.dispatchEvent(new Event('change',{{'bubbles':true}}));"); dur=time.perf_counter()-t; self.logger.debug(f"JS: Dispatch 'change' took {dur:.4f}s")
             if dur < 1.0 and self.driver.execute_script("return typeof loadCard === 'function';"):
@@ -291,7 +331,7 @@ class CardConjurerDownloader:
 
     def apply_set_symbol_override(self, base_set_code: str) -> bool:
         self.logger.info(f"Applying Set Symbol Override for code: '{base_set_code}' (will use live rarity).")
-        live_rarity = self.get_live_rarity_from_page() 
+        live_rarity = self.get_live_rarity_from_page() # Navigates to 'bottomInfo'
         target_rarity_val = None
         if live_rarity is not None and live_rarity.strip(): target_rarity_val = live_rarity.strip().upper(); self.logger.info(f"Using live rarity '{target_rarity_val}'.")
         elif live_rarity == "": self.logger.warning("Live rarity empty; rarity field not explicitly set.")
@@ -300,7 +340,7 @@ class CardConjurerDownloader:
         if not self._navigate_to_creator_tab("setSymbol"): self.logger.error("Failed nav to 'Set Symbol' for override."); return False
         
         code_input_el = self.wait_for_element("input#set-symbol-code", timeout=3)
-        if not code_input_el: self.logger.error("Set code input not found."); return False
+        if not code_input_el: self.logger.error("Set code input ('input#set-symbol-code') not found."); return False
         try:
             self.click_element_safely(code_input_el); code_input_el.clear(); code_input_el.send_keys(base_set_code)
             self.logger.info(f"Set 'set-symbol-code' to '{base_set_code}'.")
@@ -309,7 +349,7 @@ class CardConjurerDownloader:
         
         if target_rarity_val:
             rarity_input_el = self.wait_for_element("input#set-symbol-rarity", timeout=3)
-            if not rarity_input_el: self.logger.error("Set rarity input not found on Set Symbol tab.")
+            if not rarity_input_el: self.logger.error("Set rarity input ('input#set-symbol-rarity') not found on Set Symbol tab.")
             else:
                 try:
                     self.click_element_safely(rarity_input_el); rarity_input_el.clear(); rarity_input_el.send_keys(target_rarity_val)
@@ -370,7 +410,6 @@ class CardConjurerDownloader:
             time.sleep(interval)
         self.logger.warning("Timeout waiting for canvas to stabilize."); return None
 
-
     def capture_card_image_data_from_canvas(self, card_name: str, previous_canvas_hash: Optional[str]) -> Tuple[Optional[bytes], Optional[str]]:
         self.logger.info(f"Preparing to capture canvas for: {card_name}")
         new_stabilized_hash = self.wait_for_canvas_change_and_stabilization(previous_canvas_hash)
@@ -393,95 +432,134 @@ class CardConjurerDownloader:
             self.logger.error(f"Failed FINAL dataURL for '{card_name}'. Rx: {str(data_url)[:100]}"); return None, new_stabilized_hash 
         except Exception as e: self.logger.error(f"Error capturing FINAL canvas for '{card_name}': {e}",exc_info=True); return None, new_stabilized_hash
 
-    def prime_first_card_rendering(self) -> Optional[str]:
-        if len(self.cards) < 1: self.logger.info("No cards to prime."); return None
+    def prime_rendering_quirks(self) -> Optional[str]: # MODIFIED
+        if not self.cards: self.logger.info("No cards in list, skipping rendering priming."); return None
+        self.logger.info("Applying rendering quirks workaround (flavor text and first card)...")
         
-        self.logger.info("Applying workaround/priming for first card rendering...")
-        initial_hash_before_any_priming: Optional[str] = None
-        if self._current_active_tab != "art": 
+        initial_hash_for_priming: Optional[str] = None
+        if self._current_active_tab != "art":
             if not self._navigate_to_creator_tab("art"):
-                self.logger.warning("Priming: Could not switch to 'art' tab for initial hash of priming sequence.")
-        
+                self.logger.warning("Priming: Could not switch to 'art' tab for initial hash.")
         if self._current_active_tab == "art":
              temp_js_get_url="""const cSels=['#mainCanvas','#canvas','canvas'];let c=null;for(let s of cSels){c=document.querySelector(s);if(c)break;}
                                 if(!c||c.width===0||c.height===0)return null;try{return c.toDataURL('image/png');}catch(e){return 'error';}"""
              temp_url = self.driver.execute_script(temp_js_get_url)
              if temp_url and temp_url.startswith('data:image/png;base64,'):
-                 initial_hash_before_any_priming = hashlib.md5(temp_url.encode('utf-8')).hexdigest()
-                 self.logger.debug(f"Priming: Initial hash on 'art' tab before priming loads: {initial_hash_before_any_priming[:10]}")
+                 initial_hash_for_priming = hashlib.md5(temp_url.encode('utf-8')).hexdigest()
+                 self.logger.debug(f"Priming: Initial hash on 'art' tab: {initial_hash_for_priming[:10] if initial_hash_for_priming else 'None'}")
 
-        final_primed_hash = None 
-        hash_of_second_card_or_initial = initial_hash_before_any_priming 
+        hash_after_flavor_prime_ops = initial_hash_for_priming 
+
+        if self.parsed_card_data_map:
+            flavor_primer_card_name: Optional[str] = None; flavor_primer_card_index: Optional[int] = None
+            rules_key_in_file = "rules" # From your example: card_obj["data"]["text"]["rules"]["text"]
+            text_block_key = "text"     # Intermediate key
+
+            for idx, card_name_from_dropdown in enumerate(self.cards):
+                card_data_content = self.parsed_card_data_map.get(card_name_from_dropdown) # This is card_obj["data"]
+                if card_data_content and \
+                   isinstance(card_data_content.get(text_block_key), dict) and \
+                   isinstance(card_data_content[text_block_key].get(rules_key_in_file), dict) and \
+                   isinstance(card_data_content[text_block_key][rules_key_in_file].get("text"), str) and \
+                   "{flavor}" in card_data_content[text_block_key][rules_key_in_file]["text"]:
+                    flavor_primer_card_name = card_name_from_dropdown; flavor_primer_card_index = idx
+                    self.logger.info(f"Found flavor text in '{flavor_primer_card_name}' (idx {idx})."); break
+            
+            if flavor_primer_card_name is not None and flavor_primer_card_index is not None:
+                self.logger.info(f"Priming flavor text with '{flavor_primer_card_name}'...")
+                if not self._navigate_to_creator_tab("import"): return None
+                if not self.load_card(flavor_primer_card_name): self.logger.error(f"Flavor prime: Fail load '{flavor_primer_card_name}'."); return None
+                if not self._navigate_to_creator_tab("art"): return None 
+                _, hash_after_flavor_prime_ops = self.capture_card_image_data_from_canvas(flavor_primer_card_name, hash_after_flavor_prime_ops)
+                if not hash_after_flavor_prime_ops: self.logger.error(f"Flavor prime: Fail capture '{flavor_primer_card_name}'."); return None
+                
+                if flavor_primer_card_index + 1 < len(self.cards):
+                    next_card_name = self.cards[flavor_primer_card_index + 1]
+                    self.logger.info(f"Flavor prime: Loading card after flavor: '{next_card_name}'...")
+                    if not self._navigate_to_creator_tab("import"): return None
+                    if not self.load_card(next_card_name): self.logger.error(f"Flavor prime: Fail load '{next_card_name}'.")
+                    if not self._navigate_to_creator_tab("art"): return None
+                    _, hash_after_flavor_prime_ops = self.capture_card_image_data_from_canvas(next_card_name, hash_after_flavor_prime_ops)
+                    if not hash_after_flavor_prime_ops: self.logger.warning(f"Flavor prime: Failed capture for '{next_card_name}'. Hash may be stale.")
+                else: self.logger.info(f"Flavor prime: '{flavor_primer_card_name}' was last card.")
+                self.logger.info("Flavor text priming sequence complete.")
+            else: self.logger.info("No {flavor} tag found or parsed data unavailable. Skipping specific flavor priming.")
+        else: self.logger.warning("Parsed card data map empty. Skipping flavor text priming.")
+
+        final_first_card_hash: Optional[str] = None
+        current_hash_for_general_prime = hash_after_flavor_prime_ops
 
         if len(self.cards) >= 2:
             card1_name = self.cards[0]; card2_name = self.cards[1]
-            self.logger.info(f"Priming: Loading second card '{card2_name}'...")
+            # Only load card2 if it wasn't the one just loaded and captured by flavor priming's "next card"
+            if not (flavor_primer_card_name and flavor_primer_card_index is not None and \
+                    flavor_primer_card_index + 1 < len(self.cards) and self.cards[flavor_primer_card_index + 1] == card2_name and \
+                    current_hash_for_general_prime is not None): # current_hash_for_general_prime would be hash of card2
+                self.logger.info(f"General Prime: Loading second card '{card2_name}'...")
+                if not self._navigate_to_creator_tab("import"): return None
+                if not self.load_card(card2_name): self.logger.error(f"General Prime fail: load '{card2_name}'."); return None
+                if not self._navigate_to_creator_tab("art"): return None 
+                _, current_hash_for_general_prime = self.capture_card_image_data_from_canvas(card2_name, current_hash_for_general_prime) 
+                if not current_hash_for_general_prime: self.logger.error(f"General Prime fail: capture '{card2_name}'."); return None
+                self.logger.info(f"General Prime: '{card2_name}' loaded/stabilized (hash: {current_hash_for_general_prime[:10]}).")
+            else:
+                 self.logger.info(f"General Prime: Second card '{card2_name}' seems already processed by flavor prime. Using its hash: {current_hash_for_general_prime[:10] if current_hash_for_general_prime else 'None'}")
+        elif len(self.cards) == 1: self.logger.info(f"General Prime: Only one card ('{self.cards[0]}').")
+        
+        card_to_finally_load = self.cards[0]
+        needs_reload_card1 = True
+        if flavor_primer_card_name == card_to_finally_load and \
+           (flavor_primer_card_index is not None and flavor_primer_card_index + 1 >= len(self.cards)) and \
+           current_hash_for_general_prime is not None : # If card1 was the flavor primer AND the last card loaded in that sequence
+             self.logger.info(f"General Prime: First card '{card_to_finally_load}' was last in flavor prime. Using its hash.")
+             needs_reload_card1 = False
+             final_first_card_hash = current_hash_for_general_prime 
+        
+        if needs_reload_card1:
+            self.logger.info(f"General Prime: (Re)Loading first/single card '{card_to_finally_load}'...")
             if not self._navigate_to_creator_tab("import"): return None
-            if not self.load_card(card2_name): self.logger.error(f"Priming fail: load '{card2_name}'."); return None
+            if not self.load_card(card_to_finally_load): self.logger.error(f"General Prime fail: load '{card_to_finally_load}'."); return None
             if not self._navigate_to_creator_tab("art"): return None 
-            _, hash_of_second_card_or_initial = self.capture_card_image_data_from_canvas(card2_name, initial_hash_before_any_priming) 
-            if not hash_of_second_card_or_initial: self.logger.error(f"Priming fail: capture '{card2_name}'."); return None
-            self.logger.info(f"Priming: '{card2_name}' loaded/stabilized (hash: {hash_of_second_card_or_initial[:10]}).")
-        else: 
-            card1_name = self.cards[0]
-            self.logger.info(f"Only one card ('{card1_name}') for priming sequence.")
-
-        self.logger.info(f"Priming: (Re)Loading first/single card '{card1_name}'...")
-        if not self._navigate_to_creator_tab("import"): return None
-        if not self.load_card(card1_name): self.logger.error(f"Priming fail: load '{card1_name}'."); return None
-        if not self._navigate_to_creator_tab("art"): return None 
+            _, final_first_card_hash = self.capture_card_image_data_from_canvas(card_to_finally_load, current_hash_for_general_prime) 
+            if not final_first_card_hash: self.logger.error(f"General Prime fail: capture (re)loaded '{card_to_finally_load}'."); return None
         
-        _, final_primed_hash = self.capture_card_image_data_from_canvas(card1_name, hash_of_second_card_or_initial) 
-        if not final_primed_hash: self.logger.error(f"Priming fail: capture (re)loaded '{card1_name}'."); return None
-        
-        self.logger.info(f"Priming complete. Card '{card1_name}' (re)loaded/stabilized (hash: {final_primed_hash[:10]}).")
-        return final_primed_hash
+        self.logger.info(f"All Priming complete. Card '{card_to_finally_load}' loaded/stabilized (hash: {final_first_card_hash[:10] if final_first_card_hash else 'None'}).")
+        self._current_active_tab = "art" 
+        return final_first_card_hash
 
-    def create_zip_of_all_cards(self) -> bool: # MODIFIED
-        self.logger.info("Starting image processing and ZIP creation (Smart Canvas + Full Opts + Preprocessing v6.5)")
+    def create_zip_of_all_cards(self) -> bool:
+        self.logger.info("Starting image processing and ZIP creation (Smart Canvas + Full Opts + Preprocessing v6.8)")
         current_canvas_hash: Optional[str] = None 
-        
         if not self.cards: self.logger.info("Card list empty, fetching..."); self.get_saved_cards()
         if not self.cards: self.logger.error("No cards for ZIP."); return False
-
-        current_canvas_hash = self.prime_first_card_rendering()
-
-        ts=datetime.now().strftime("%Y%m%d_%H%M%S");zip_temp_fp=Path(self.download_dir)/f"CC_Temp_Images_v6.5_{ts}.zip" # Temp ZIP name
+        current_canvas_hash = self.prime_rendering_quirks()
+        ts=datetime.now().strftime("%Y%m%d_%H%M%S");zip_temp_fp=Path(self.download_dir)/f"CC_FullWorkflow_v6.8_{ts}.zip"
         self.logger.info(f"Temporarily creating ZIP: {zip_temp_fp}"); s_cards, f_cards_info = 0, []
-        
         try:
             with zipfile.ZipFile(zip_temp_fp,'w',zipfile.ZIP_DEFLATED) as zf:
                 for i,name in enumerate(self.cards):
                     self.logger.info(f"Processing {i+1}/{len(self.cards)}: '{name}'")
-                    
                     is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
-
                     if not is_first_card_and_was_successfully_primed:
                         if not self._navigate_to_creator_tab("import"): f_cards_info.append(f"{name}(import nav fail)");continue
                         if not self.load_card(name): f_cards_info.append(f"{name}(load fail)");continue
                     else:
-                        self.logger.info(f"Skipping explicit load for '{name}' as it was handled by priming.")
+                        self.logger.info(f"Skipping explicit load for '{name}' (handled by priming). Ensuring 'art' tab.")
                         if self._current_active_tab != "art": 
-                            if not self._navigate_to_creator_tab("art"):
-                                f_cards_info.append(f"{name}(art tab nav fail post-prime)"); continue
-                    
+                            if not self._navigate_to_creator_tab("art"): f_cards_info.append(f"{name}(art tab nav fail post-prime)"); continue
                     if self.set_symbol_override_code and not self.apply_set_symbol_override(self.set_symbol_override_code): self.logger.warning(f"Failed set symbol override for '{name}'.")
                     if self.auto_fit_set_symbol_enabled and not self.apply_auto_fit_set_symbol(): self.logger.warning(f"Failed auto fit set symbol for '{name}'.")
                     if self.auto_fit_art_enabled and not self.apply_auto_fit_art(): self.logger.warning(f"Failed auto fit art for '{name}'.")
-                    
                     capture_tab = "art" 
                     if self._current_active_tab != capture_tab: 
                         self.logger.info(f"Ensuring on '{capture_tab}' tab for canvas capture of '{name}'.")
                         if not self._navigate_to_creator_tab(capture_tab): f_cards_info.append(f"{name}(capture tab nav fail)");continue
-                    
                     img_bytes, new_hash_after_capture = self.capture_card_image_data_from_canvas(name, current_canvas_hash)
                     current_canvas_hash = new_hash_after_capture 
-                    
                     if img_bytes: 
                         arc_name="".join(c for c in name if c.isalnum()or c in (' ','-','_')).rstrip()+".png"
                         zf.writestr(arc_name,img_bytes);self.logger.info(f"Added '{arc_name}' to temp ZIP.");s_cards+=1
                     else: f_cards_info.append(f"{name}(capture fail)")
-
             self.logger.info(f"Temporary ZIP creation: {s_cards}/{len(self.cards)} cards captured.")
             if s_cards > 0:
                 self.logger.info(f"Extracting images from {zip_temp_fp} to {self.download_dir}...")
@@ -494,26 +572,19 @@ class CardConjurerDownloader:
             else: self.logger.warning("No cards in temp ZIP. Nothing to extract.")
         except Exception as e_zip: 
             self.logger.error(f"Temp ZIP/Extraction err: {e_zip}",exc_info=True)
-            if os.path.exists(zip_temp_fp): # CORRECTED try-except for remove
-                try: 
-                    os.remove(zip_temp_fp)
-                    self.logger.info(f"Removed incomplete temporary ZIP: {zip_temp_fp}")
-                except Exception as e_del: 
-                    self.logger.error(f"Err removing temp ZIP {zip_temp_fp} after error: {e_del}")
+            if os.path.exists(zip_temp_fp): 
+                try: os.remove(zip_temp_fp); self.logger.info(f"Removed incomplete temporary ZIP: {zip_temp_fp}") 
+                except Exception as e_del: self.logger.error(f"Err removing temp ZIP {zip_temp_fp} after error: {e_del}")
             return False
         finally: 
-            if os.path.exists(zip_temp_fp): # CORRECTED try-except for remove
-                try:
-                    os.remove(zip_temp_fp)
-                    self.logger.info(f"Deleted temp ZIP: {zip_temp_fp}")
-                except Exception as e_del_f: 
-                    self.logger.error(f"Err deleting final temp ZIP: {e_del_f}")
-        
+            if os.path.exists(zip_temp_fp):
+                try: os.remove(zip_temp_fp); self.logger.info(f"Deleted temp ZIP: {zip_temp_fp}")
+                except Exception as e_del_f: self.logger.error(f"Err deleting final temp ZIP: {e_del_f}")
         if f_cards_info: self.logger.warning(f"Failed ops ({len(f_cards_info)}): {', '.join(f_cards_info)}")
         return s_cards > 0
 
-    def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None, args_for_optional_features=None): # CORRECTED
-        self.logger.info(f"Run (Smart Canvas + Full Opts v6.5 Incognito) action:{action} headless:{headless} frame:{frame}")
+    def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None, args_for_optional_features=None):
+        self.logger.info(f"Run (Smart Canvas + Full Opts v6.8 Incognito) action:{action} headless:{headless} frame:{frame}")
         if args_for_optional_features:
             self.auto_fit_art_enabled = getattr(args_for_optional_features, 'auto_fit_art', False)
             self.auto_fit_set_symbol_enabled = getattr(args_for_optional_features, 'auto_fit_set_symbol', False)
@@ -521,11 +592,14 @@ class CardConjurerDownloader:
             if self.auto_fit_art_enabled: self.logger.info("Opt Feature: Auto Fit Art ENABLED")
             if self.auto_fit_set_symbol_enabled: self.logger.info("Opt Feature: Auto Fit Set Symbol (Reset) ENABLED")
             if self.set_symbol_override_code: self.logger.info(f"Opt Feature: Set Symbol Override with code '{self.set_symbol_override_code}' (will use live rarity).")
-        
         try:
             self.setup_driver(headless=headless) 
             if not self.navigate_to_card_conjurer(): return 
             time.sleep(self.delays['js_init'])
+            
+            if cardconjurer_file: # Parse file before any CC interaction that might depend on it
+                if not self._parse_cardconjurer_file_content(cardconjurer_file):
+                    self.logger.warning(f"Failed to parse {cardconjurer_file}. Data-dependent features may fail.")
             
             if frame: 
                 if self._current_active_tab != "art": 
@@ -535,7 +609,7 @@ class CardConjurerDownloader:
                      self.logger.warning(f"Failed frame setting for '{frame}'.")
             
             if cardconjurer_file:
-                if not self.upload_cardconjurer_file(file_path=cardconjurer_file): # Removed frame_to_set...
+                if not self.upload_cardconjurer_file(file_path=cardconjurer_file): 
                     self.logger.error(f"Fail upload/load from: {cardconjurer_file}. Abort."); return
             elif not cardconjurer_file: 
                 self.logger.info("No file. Check existing cards...");
@@ -545,8 +619,7 @@ class CardConjurerDownloader:
 
             if action=="zip":
                 if not self.cards: self.get_saved_cards() 
-                if not self.cards: self.logger.error("No cards to process."); return # Changed log
-                
+                if not self.cards: self.logger.error("No cards to process."); return 
                 extraction_successful = self.create_zip_of_all_cards() 
                 if extraction_successful: 
                     self.logger.info(f"Image extraction complete. Files are in: {self.download_dir}")
@@ -561,7 +634,7 @@ class CardConjurerDownloader:
                 self.driver.quit(); self.logger.info("Browser closed.")
 
 def main():
-    p = argparse.ArgumentParser(description='Card Conjurer Downloader - Smart Canvas Capture with Preprocessing & Full Optional Features (v6.5)')
+    p = argparse.ArgumentParser(description='Card Conjurer Downloader - Smart Canvas Capture with Preprocessing & Full Optional Features (v6.8)')
     p.add_argument('--file','-f',required=True,help='.cardconjurer file to load')
     p.add_argument('--url',default='http://mtgproxy:4242',help='Card Conjurer URL')
     p.add_argument('--output',default=None,help='Output directory for extracted images and logs')
