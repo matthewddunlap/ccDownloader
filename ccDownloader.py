@@ -32,7 +32,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
 class CardConjurerDownloader:
-    def __init__(self, url="http://mtgproxy:4242", download_dir=None, log_level=logging.INFO):
+    def __init__(self, url="https://cardconjurer.app:443", download_dir=None, log_level=logging.INFO):
         self.url = url
         self.download_dir = download_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
         self.driver = None
@@ -636,7 +636,7 @@ class CardConjurerDownloader:
 def main():
     p = argparse.ArgumentParser(description='Card Conjurer Downloader - Smart Canvas Capture with Preprocessing & Full Optional Features (v6.8)')
     p.add_argument('--file','-f',required=True,help='.cardconjurer file to load')
-    p.add_argument('--url',default='http://mtgproxy:4242',help='Card Conjurer URL')
+    p.add_argument('--url',default='https://cardconjurer.app:443',help='Card Conjurer URL')
     p.add_argument('--output',default=None,help='Output directory for extracted images and logs')
     p.add_argument('--headless',action='store_true',help='Run in headless mode')
     p.add_argument('--frame',choices=['7th','seventh','8th','eighth','m15','ub'],help='Auto frame setting')
