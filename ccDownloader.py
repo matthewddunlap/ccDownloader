@@ -1,8 +1,9 @@
+# --- ccDownloader.py ---
 """
-Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v6.9 - Enhanced Priming for Flavor Text)
+Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v7.0 - Web Server Upload)
 
-Captures card images directly from the canvas using toDataURL and zips them.
-Uses a smart wait to detect canvas changes and stabilization.
+Captures card images directly from the canvas using toDataURL.
+Can either save images to a local directory (via a temporary zip) or upload them directly to a WebDAV server.
 Includes:
 - Runs in Incognito mode for a clean slate each time.
 - Enhanced post-upload priming: handles general first card quirk and {flavor} text rendering.
@@ -21,7 +22,18 @@ from pathlib import Path
 import zipfile
 import base64 
 import hashlib 
-from typing import Optional, Tuple, Dict # Added Dict
+from typing import Optional, Tuple, Dict
+
+# --- NEW: Add requests dependency for uploading ---
+# Note: This script now requires the 'requests' library for the upload feature.
+# Install it using: pip install requests
+try:
+    import requests
+except ImportError:
+    print("Error: The 'requests' library is required for the --upload-to-server feature.")
+    print("Please install it using: pip install requests")
+    sys.exit(1)
+# --- END NEW ---
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -31,18 +43,76 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
+# --- NEW: Web Server Upload Functions (from MtgPng2Pdf.py) ---
+def check_server_file_exists(url: str, debug: bool = False) -> bool:
+    """Check if a file already exists at a given URL using a HEAD request."""
+    if not url:
+        return False
+    if debug:
+        print(f"DEBUG: Checking for file existence at: {url}")
+    try:
+        r = requests.head(url, timeout=15, allow_redirects=True)
+        if r.status_code == 200:
+            if debug: print(f"DEBUG: File exists (200 OK) at {url}")
+            return True
+        if r.status_code == 404:
+            if debug: print(f"DEBUG: File not found (404) at {url}")
+            return False
+        print(f"Warning: Received status {r.status_code} when checking {url}. Assuming it does not exist.")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Network error while checking {url}: {e}. Assuming it does not exist.")
+        return False
+
+def upload_file_to_server(url: str, file_bytes: bytes, mime_type: str, debug: bool = False) -> bool:
+    """Uploads file content (bytes) to a server URL using PUT."""
+    if not url:
+        print("Error: Cannot upload file, server URL is not configured.")
+        return False
+    if not file_bytes:
+        print("Warning: No file content (bytes) to upload.")
+        return False
+
+    print(f"Uploading to: {url}")
+    headers = {'Content-Type': mime_type}
+    try:
+        r = requests.put(url, data=file_bytes, headers=headers, timeout=60)
+        r.raise_for_status()  # Raises an exception for 4xx/5xx status codes
+        if 200 <= r.status_code < 300:
+            print(f"Successfully uploaded. URL: {url}")
+            return True
+        else:
+            print(f"Error: Upload failed with status {r.status_code}.")
+            if r.text: print(f"Server Response: {r.text}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Upload failed due to a network error: {e}")
+        if e.response is not None:
+            print(f"Server Response Body: {e.response.text}")
+        return False
+# --- END NEW ---
+
 class CardConjurerDownloader:
-    def __init__(self, url="https://cardconjurer.app:443", download_dir=None, log_level=logging.INFO):
+    # --- MODIFIED: __init__ to accept server args ---
+    def __init__(self, url="https://cardconjurer.app:443", output_dir=None, log_level=logging.INFO, **kwargs):
         self.url = url
-        self.download_dir = download_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
+        self.output_dir = output_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
         self.driver = None
-        self.cards = [] # List of card names from the dropdown
-        self.parsed_card_data_map: Dict[str, Dict] = {} # cardName -> cardObject (inner "data" part)
+        self.cards = []
+        self.parsed_card_data_map: Dict[str, Dict] = {}
         self._current_active_tab: Optional[str] = None 
 
+        # Optional features
         self.auto_fit_art_enabled = False
         self.auto_fit_set_symbol_enabled = False
         self.set_symbol_override_code = None
+
+        # --- NEW: Server upload attributes ---
+        self.upload_to_server = kwargs.get('upload_to_server', False)
+        self.image_server_base_url = kwargs.get('image_server_base_url', None)
+        self.output_server_path = kwargs.get('output_server_path', None)
+        self.overwrite_server_file = kwargs.get('overwrite_server_file', False)
+        self.debug_mode = log_level == logging.DEBUG
 
         self.delays = {
             'page_load': 0.1, 'tab_switch': 0.1, 'file_upload_wait': 10.0, 
@@ -53,14 +123,17 @@ class CardConjurerDownloader:
             'set_symbol_fetch_wait': 1.5   
         }
 
-        Path(self.download_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         self.setup_logging(log_level)
-        self.logger.info(f"Initialized CC Downloader (Smart Canvas v6.9 - Enhanced Priming)")
+        self.logger.info(f"Initialized CC Downloader (v7.0 - Web Server Upload)")
         self.logger.info(f"URL: {self.url}")
-        self.logger.info(f"Output directory: {self.download_dir}")
+        if self.upload_to_server:
+            self.logger.info(f"UPLOAD MODE: Enabled. Target server: {self.image_server_base_url}, Path: {self.output_server_path}")
+        else:
+            self.logger.info(f"LOCAL MODE: Output directory: {self.output_dir}")
 
     def setup_logging(self, log_level):
-        log_dir = Path(self.download_dir) / "logs"
+        log_dir = Path(self.output_dir) / "logs"
         log_dir.mkdir(exist_ok=True)
         self.logger = logging.getLogger('CardConjurer')
         self.logger.setLevel(logging.DEBUG) 
@@ -68,12 +141,13 @@ class CardConjurerDownloader:
         dt_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         s_fmt = '%(asctime)s - %(levelname)s - %(message)s'
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_fn = log_dir / f"cc_v6.9_enhanced_prime_{ts}.log"
+        log_fn = log_dir / f"cc_v7.0_server_upload_{ts}.log"
         fh = logging.FileHandler(log_fn); fh.setLevel(logging.DEBUG); fh.setFormatter(logging.Formatter(dt_fmt))
         ch = logging.StreamHandler(sys.stdout); ch.setLevel(log_level); ch.setFormatter(logging.Formatter(s_fmt))
         self.logger.addHandler(fh); self.logger.addHandler(ch)
         self.logger.info(f"Logging to: {log_fn}")
 
+    # ... (All other methods from setup_driver to prime_rendering_quirks remain unchanged) ...
     def setup_driver(self, headless=False):
         self.logger.info(f"Setting up Chrome driver (headless={headless}) in INCOGNITO mode.")
         chrome_options = Options()
@@ -527,64 +601,115 @@ class CardConjurerDownloader:
         self._current_active_tab = "art" 
         return final_first_card_hash
 
-    def create_zip_of_all_cards(self) -> bool:
-        self.logger.info("Starting image processing and ZIP creation (Smart Canvas + Full Opts + Preprocessing v6.8)")
+    # --- MODIFIED: Renamed and refactored for dual output modes ---
+    def process_and_output_all_cards(self) -> bool:
+        if self.upload_to_server:
+            self.logger.info("Starting image processing for SERVER UPLOAD.")
+        else:
+            self.logger.info("Starting image processing for LOCAL DIRECTORY output (via temp ZIP).")
+
         current_canvas_hash: Optional[str] = None 
         if not self.cards: self.logger.info("Card list empty, fetching..."); self.get_saved_cards()
-        if not self.cards: self.logger.error("No cards for ZIP."); return False
+        if not self.cards: self.logger.error("No cards to process."); return False
+        
         current_canvas_hash = self.prime_rendering_quirks()
-        ts=datetime.now().strftime("%Y%m%d_%H%M%S");zip_temp_fp=Path(self.download_dir)/f"CC_FullWorkflow_v6.8_{ts}.zip"
-        self.logger.info(f"Temporarily creating ZIP: {zip_temp_fp}"); s_cards, f_cards_info = 0, []
-        try:
-            with zipfile.ZipFile(zip_temp_fp,'w',zipfile.ZIP_DEFLATED) as zf:
-                for i,name in enumerate(self.cards):
-                    self.logger.info(f"Processing {i+1}/{len(self.cards)}: '{name}'")
-                    is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
-                    if not is_first_card_and_was_successfully_primed:
-                        if not self._navigate_to_creator_tab("import"): f_cards_info.append(f"{name}(import nav fail)");continue
-                        if not self.load_card(name): f_cards_info.append(f"{name}(load fail)");continue
-                    else:
-                        self.logger.info(f"Skipping explicit load for '{name}' (handled by priming). Ensuring 'art' tab.")
-                        if self._current_active_tab != "art": 
-                            if not self._navigate_to_creator_tab("art"): f_cards_info.append(f"{name}(art tab nav fail post-prime)"); continue
-                    if self.set_symbol_override_code and not self.apply_set_symbol_override(self.set_symbol_override_code): self.logger.warning(f"Failed set symbol override for '{name}'.")
-                    if self.auto_fit_set_symbol_enabled and not self.apply_auto_fit_set_symbol(): self.logger.warning(f"Failed auto fit set symbol for '{name}'.")
-                    if self.auto_fit_art_enabled and not self.apply_auto_fit_art(): self.logger.warning(f"Failed auto fit art for '{name}'.")
-                    capture_tab = "art" 
-                    if self._current_active_tab != capture_tab: 
-                        self.logger.info(f"Ensuring on '{capture_tab}' tab for canvas capture of '{name}'.")
-                        if not self._navigate_to_creator_tab(capture_tab): f_cards_info.append(f"{name}(capture tab nav fail)");continue
-                    img_bytes, new_hash_after_capture = self.capture_card_image_data_from_canvas(name, current_canvas_hash)
-                    current_canvas_hash = new_hash_after_capture 
-                    if img_bytes: 
-                        arc_name="".join(c for c in name if c.isalnum()or c in (' ','-','_')).rstrip()+".png"
-                        zf.writestr(arc_name,img_bytes);self.logger.info(f"Added '{arc_name}' to temp ZIP.");s_cards+=1
-                    else: f_cards_info.append(f"{name}(capture fail)")
-            self.logger.info(f"Temporary ZIP creation: {s_cards}/{len(self.cards)} cards captured.")
-            if s_cards > 0:
-                self.logger.info(f"Extracting images from {zip_temp_fp} to {self.download_dir}...")
+        s_cards, f_cards_info = 0, []
+
+        # --- Main processing loop ---
+        for i, name in enumerate(self.cards):
+            self.logger.info(f"Processing {i+1}/{len(self.cards)}: '{name}'")
+            is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
+            
+            if not is_first_card_and_was_successfully_primed:
+                if not self._navigate_to_creator_tab("import"): f_cards_info.append(f"{name}(import nav fail)"); continue
+                if not self.load_card(name): f_cards_info.append(f"{name}(load fail)"); continue
+            else:
+                self.logger.info(f"Skipping explicit load for '{name}' (handled by priming). Ensuring 'art' tab.")
+                if self._current_active_tab != "art": 
+                    if not self._navigate_to_creator_tab("art"): f_cards_info.append(f"{name}(art tab nav fail post-prime)"); continue
+            
+            # Apply optional features
+            if self.set_symbol_override_code and not self.apply_set_symbol_override(self.set_symbol_override_code): self.logger.warning(f"Failed set symbol override for '{name}'.")
+            if self.auto_fit_set_symbol_enabled and not self.apply_auto_fit_set_symbol(): self.logger.warning(f"Failed auto fit set symbol for '{name}'.")
+            if self.auto_fit_art_enabled and not self.apply_auto_fit_art(): self.logger.warning(f"Failed auto fit art for '{name}'.")
+            
+            # Capture canvas
+            capture_tab = "art" 
+            if self._current_active_tab != capture_tab: 
+                self.logger.info(f"Ensuring on '{capture_tab}' tab for canvas capture of '{name}'.")
+                if not self._navigate_to_creator_tab(capture_tab): f_cards_info.append(f"{name}(capture tab nav fail)"); continue
+            
+            img_bytes, new_hash_after_capture = self.capture_card_image_data_from_canvas(name, current_canvas_hash)
+            current_canvas_hash = new_hash_after_capture 
+            
+            if not img_bytes:
+                f_cards_info.append(f"{name}(capture fail)")
+                continue
+
+            # --- NEW: Conditional Output Logic ---
+            output_filename = "".join(c for c in name if c.isalnum() or c in (' ','-','_')).rstrip() + ".png"
+
+            if self.upload_to_server:
+                # --- UPLOAD TO SERVER PATH ---
+                path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
+                full_path = "/".join(p for p in path_parts if p)
+                if not full_path.startswith('/'): full_path = '/' + full_path
+                upload_url = f"{self.image_server_base_url.rstrip('/')}{full_path}"
+
+                if not self.overwrite_server_file and check_server_file_exists(upload_url, self.debug_mode):
+                    self.logger.warning(f"Skipping upload for '{output_filename}', file exists on server. Use --overwrite-server-file.")
+                    f_cards_info.append(f"{name}(exists on server)")
+                    continue
+                
+                if upload_file_to_server(upload_url, img_bytes, 'image/png', self.debug_mode):
+                    s_cards += 1
+                else:
+                    f_cards_info.append(f"{name}(upload fail)")
+            else:
+                # --- LOCAL DIRECTORY PATH (original logic) ---
+                # This part is deferred until after the loop for local mode
+                f_cards_info.append({'name': output_filename, 'bytes': img_bytes}) # Store for zipping later
+                s_cards += 1 # Tentatively count as success
+
+        # --- Post-loop processing for local mode ---
+        if not self.upload_to_server:
+            successful_local_cards = [c for c in f_cards_info if isinstance(c, dict)]
+            failed_local_cards = [c for c in f_cards_info if isinstance(c, str)]
+            
+            if not successful_local_cards:
+                self.logger.warning("No cards were successfully captured for local saving.")
+                if failed_local_cards: self.logger.warning(f"Failed ops ({len(failed_local_cards)}): {', '.join(failed_local_cards)}")
+                return False
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_temp_fp = Path(self.output_dir) / f"CC_Temp_v7.0_{ts}.zip"
+            self.logger.info(f"Creating temporary ZIP for local extraction: {zip_temp_fp}")
+            try:
+                with zipfile.ZipFile(zip_temp_fp, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for card_data in successful_local_cards:
+                        zf.writestr(card_data['name'], card_data['bytes'])
+                
+                self.logger.info(f"Extracting {len(successful_local_cards)} images from {zip_temp_fp} to {self.output_dir}...")
                 with zipfile.ZipFile(zip_temp_fp, 'r') as zf_read:
-                    extracted_count = 0
-                    for member in zf_read.namelist():
-                        try: zf_read.extract(member, self.download_dir); self.logger.info(f"Extracted: {member}"); extracted_count+=1
-                        except Exception as e_ex: self.logger.error(f"Error extracting {member}: {e_ex}"); f_cards_info.append(f"{member}(extract fail)")
-                self.logger.info(f"Successfully extracted {extracted_count} image(s).")
-            else: self.logger.warning("No cards in temp ZIP. Nothing to extract.")
-        except Exception as e_zip: 
-            self.logger.error(f"Temp ZIP/Extraction err: {e_zip}",exc_info=True)
-            if os.path.exists(zip_temp_fp): 
-                try: os.remove(zip_temp_fp); self.logger.info(f"Removed incomplete temporary ZIP: {zip_temp_fp}") 
-                except Exception as e_del: self.logger.error(f"Err removing temp ZIP {zip_temp_fp} after error: {e_del}")
-            return False
-        finally: 
-            if os.path.exists(zip_temp_fp):
-                try: os.remove(zip_temp_fp); self.logger.info(f"Deleted temp ZIP: {zip_temp_fp}")
-                except Exception as e_del_f: self.logger.error(f"Err deleting final temp ZIP: {e_del_f}")
+                    zf_read.extractall(self.output_dir)
+                self.logger.info(f"Successfully extracted {len(successful_local_cards)} image(s).")
+
+            except Exception as e_zip:
+                self.logger.error(f"Temp ZIP/Extraction error: {e_zip}", exc_info=True)
+                return False
+            finally:
+                if os.path.exists(zip_temp_fp):
+                    try: os.remove(zip_temp_fp); self.logger.info(f"Deleted temp ZIP: {zip_temp_fp}")
+                    except Exception as e_del: self.logger.error(f"Error deleting temp ZIP: {e_del}")
+            
+            if failed_local_cards: self.logger.warning(f"Failed ops ({len(failed_local_cards)}): {', '.join(failed_local_cards)}")
+            return len(successful_local_cards) > 0
+
         if f_cards_info: self.logger.warning(f"Failed ops ({len(f_cards_info)}): {', '.join(f_cards_info)}")
         return s_cards > 0
 
     def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None, args_for_optional_features=None):
-        self.logger.info(f"Run (Smart Canvas + Full Opts v6.8 Incognito) action:{action} headless:{headless} frame:{frame}")
+        self.logger.info(f"Run (v7.0) action:{action} headless:{headless} frame:{frame}")
         if args_for_optional_features:
             self.auto_fit_art_enabled = getattr(args_for_optional_features, 'auto_fit_art', False)
             self.auto_fit_set_symbol_enabled = getattr(args_for_optional_features, 'auto_fit_set_symbol', False)
@@ -597,7 +722,7 @@ class CardConjurerDownloader:
             if not self.navigate_to_card_conjurer(): return 
             time.sleep(self.delays['js_init'])
             
-            if cardconjurer_file: # Parse file before any CC interaction that might depend on it
+            if cardconjurer_file:
                 if not self._parse_cardconjurer_file_content(cardconjurer_file):
                     self.logger.warning(f"Failed to parse {cardconjurer_file}. Data-dependent features may fail.")
             
@@ -617,14 +742,20 @@ class CardConjurerDownloader:
                 if on_imp and not self.check_cards_loaded(): self.logger.warning("No cards loaded (dropdown).")
                 elif not on_imp: self.logger.warning("Cannot check cards, import nav fail.")
 
-            if action=="zip":
+            if action=="zip": # "zip" action now means "process and output"
                 if not self.cards: self.get_saved_cards() 
                 if not self.cards: self.logger.error("No cards to process."); return 
-                extraction_successful = self.create_zip_of_all_cards() 
-                if extraction_successful: 
-                    self.logger.info(f"Image extraction complete. Files are in: {self.download_dir}")
+                
+                # --- MODIFIED: Call the new refactored function ---
+                output_successful = self.process_and_output_all_cards() 
+                
+                if output_successful: 
+                    if self.upload_to_server:
+                        self.logger.info(f"Image upload process complete.")
+                    else:
+                        self.logger.info(f"Image extraction complete. Files are in: {self.output_dir}")
                 else: 
-                    self.logger.error("Image processing and extraction failed or no images were processed.")
+                    self.logger.error("Image processing and output failed or no images were processed.")
         except Exception as e: self.logger.error(f"Unhandled run err: {e}",exc_info=True)
         finally:
             if self.driver:
@@ -634,24 +765,63 @@ class CardConjurerDownloader:
                 self.driver.quit(); self.logger.info("Browser closed.")
 
 def main():
-    p = argparse.ArgumentParser(description='Card Conjurer Downloader - Smart Canvas Capture with Preprocessing & Full Optional Features (v6.8)')
+    p = argparse.ArgumentParser(description='Card Conjurer Downloader - v7.0 with Local and Web Server Output')
     p.add_argument('--file','-f',required=True,help='.cardconjurer file to load')
     p.add_argument('--url',default='https://cardconjurer.app:443',help='Card Conjurer URL')
-    p.add_argument('--output',default=None,help='Output directory for extracted images and logs')
+    # --- MODIFIED: Renamed --output to --output-dir for clarity ---
+    p.add_argument('--output-dir',default=None,help='Local output directory for extracted images and logs. Used if --upload-to-server is not specified.')
     p.add_argument('--headless',action='store_true',help='Run in headless mode')
     p.add_argument('--frame',choices=['7th','seventh','8th','eighth','m15','ub'],help='Auto frame setting')
     p.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'],help='Console logging level')
     
-    p.add_argument('--auto-fit-art', action='store_true', help='Enable Auto Fit Art feature.')
-    p.add_argument('--auto-fit-set-symbol', action='store_true', help='Enable Reset Set Symbol (auto fit) feature.')
-    p.add_argument('--set-symbol-override', type=str, default=None, metavar='CODE', 
+    # --- Optional Features Group ---
+    opt_group = p.add_argument_group('Optional Card-Specific Features')
+    opt_group.add_argument('--auto-fit-art', action='store_true', help='Enable Auto Fit Art feature.')
+    opt_group.add_argument('--auto-fit-set-symbol', action='store_true', help='Enable Reset Set Symbol (auto fit) feature.')
+    opt_group.add_argument('--set-symbol-override', type=str, default=None, metavar='CODE', 
                        help='Override set symbol with CODE (e.g., "MH2"). Live rarity from Collector tab will be used.')
+
+    # --- NEW: Web Server Upload Options ---
+    webserver_upload_group = p.add_argument_group('Web Server Upload Options')
+    webserver_upload_group.add_argument(
+        "--upload-to-server", action="store_true",
+        help="Upload the generated PNGs to a WebDAV server instead of saving them locally."
+    )
+    webserver_upload_group.add_argument(
+        "--image-server-base-url", type=str, default=None,
+        help="Base URL of the WebDAV image server (e.g., http://localhost:8088). Required for upload."
+    )
+    webserver_upload_group.add_argument(
+        "--output-server-path", type=str, default=None,
+        help="Subdirectory on the server to upload the PNGs to (e.g., '/my-cards/new-set/'). Required for upload."
+    )
+    webserver_upload_group.add_argument(
+        "--overwrite-server-file", action="store_true",
+        help="If a file with the same name exists on the server, overwrite it. Default is to fail."
+    )
     
     a = p.parse_args()
     if not os.path.exists(a.file): print(f"Error: File not found: {a.file}");sys.exit(1)
+    
+    # --- NEW: Validation for upload arguments ---
+    if a.upload_to_server:
+        if not a.image_server_base_url:
+            p.error("--upload-to-server requires --image-server-base-url.")
+        if not a.output_server_path:
+            p.error("--upload-to-server requires --output-server-path.")
+
     log_lvl_val = getattr(logging, a.log_level.upper(), logging.INFO)
     
-    downloader = CardConjurerDownloader(url=a.url,download_dir=a.output,log_level=log_lvl_val)
+    # --- MODIFIED: Pass new arguments to the downloader class ---
+    downloader = CardConjurerDownloader(
+        url=a.url,
+        output_dir=a.output_dir,
+        log_level=log_lvl_val,
+        upload_to_server=a.upload_to_server,
+        image_server_base_url=a.image_server_base_url,
+        output_server_path=a.output_server_path,
+        overwrite_server_file=a.overwrite_server_file
+    )
     downloader.run(cardconjurer_file=a.file,headless=a.headless,frame=a.frame, args_for_optional_features=a)
 
 if __name__ == "__main__":
