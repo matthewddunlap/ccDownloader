@@ -9,6 +9,7 @@ Includes:
 - Enhanced post-upload priming: handles general first card quirk and {flavor} text rendering.
 - Optional features for art and set symbol manipulation.
 - Set Symbol Override now always uses live rarity, populating separate fields.
+- Filename format: [name-with-dashes]_[set]_[number].png
 """
 
 import os
@@ -506,6 +507,72 @@ class CardConjurerDownloader:
             self.logger.error(f"Failed FINAL dataURL for '{card_name}'. Rx: {str(data_url)[:100]}"); return None, new_stabilized_hash 
         except Exception as e: self.logger.error(f"Error capturing FINAL canvas for '{card_name}': {e}",exc_info=True); return None, new_stabilized_hash
 
+    def _generate_filename(self, card_name: str) -> str:
+        """
+        Generates a sanitized, lowercase filename based on card name, set, and collector number.
+        Format: [card-name]_[set-code]_[collector-number].png
+        Example: izzet-boilerworks_2x2_408.png
+        
+        Note: card_name parameter is the dropdown identifier, but we extract the actual
+        card name from the CardConjurer data structure to avoid duplication.
+        """
+        # Default values if data is missing
+        set_code_default = 'noset'
+        collector_number_default = 'nonum'
+        actual_card_name_default = 'unknown'
+    
+        set_code = set_code_default
+        collector_number = collector_number_default
+        actual_card_name = actual_card_name_default
+    
+        # Retrieve card-specific data from the parsed map
+        card_data = self.parsed_card_data_map.get(card_name)
+        if card_data:
+            # Extract actual card name from CardConjurer data structure
+            text_data = card_data.get('text', {})
+            title_data = text_data.get('title', {}) if isinstance(text_data, dict) else {}
+            actual_card_name = title_data.get('text', actual_card_name_default) if isinstance(title_data, dict) else actual_card_name_default
+            
+            # Extract set and collector number
+            set_code = card_data.get('infoSet', set_code_default)
+            collector_number = card_data.get('infoNumber', collector_number_default)
+            
+            self.logger.debug(f"For dropdown '{card_name}': actual name='{actual_card_name}', set='{set_code}', num='{collector_number}'.")
+        else:
+            self.logger.warning(f"Could not find parsed data for '{card_name}'. Using dropdown identifier as fallback.")
+            # Fallback: use the dropdown identifier, but try to clean it if it's already formatted
+            if '_' in card_name:
+                # Assume it's already in format "name_set_number" and extract just the name part
+                actual_card_name = card_name.split('_')[0]
+                self.logger.debug(f"Extracted name part from formatted identifier: '{actual_card_name}'")
+            else:
+                actual_card_name = card_name
+        
+        # Sanitize actual card name: lowercase, replace spaces with dashes, remove special characters
+        import re
+        clean_name = re.sub(r'[^\w\s-]', '', actual_card_name.lower())  # Remove special chars except spaces and dashes
+        clean_name = re.sub(r'\s+', '-', clean_name.strip())           # Replace spaces with dashes
+        clean_name = re.sub(r'-+', '-', clean_name)                    # Collapse multiple dashes
+        
+        # Clean up set code and collector number
+        set_code_clean = str(set_code).lower().strip()
+        collector_number_clean = str(collector_number).lower().strip()
+    
+        # Assemble the filename parts, avoiding empty parts which could cause double delimiters
+        parts = [clean_name]
+        if set_code_clean and set_code_clean != set_code_default:
+            parts.append(set_code_clean)
+        if collector_number_clean and collector_number_clean != collector_number_default:
+            parts.append(collector_number_clean)
+        
+        base_filename = "_".join(parts)  # Use underscore as the main delimiter
+        
+        # Final sanitization for any remaining invalid characters
+        # Allow alphanumeric, dashes (for card name), and underscores (for delimiters)
+        final_filename_base = "".join(c for c in base_filename if c.isalnum() or c == '-' or c == '_')
+        
+        return f"{final_filename_base}.png"
+
     def prime_rendering_quirks(self) -> Optional[str]: # MODIFIED
         if not self.cards: self.logger.info("No cards in list, skipping rendering priming."); return None
         self.logger.info("Applying rendering quirks workaround (flavor text and first card)...")
@@ -646,8 +713,9 @@ class CardConjurerDownloader:
                 f_cards_info.append(f"{name}(capture fail)")
                 continue
 
-            # --- NEW: Conditional Output Logic ---
-            output_filename = "".join(c for c in name if c.isalnum() or c in (' ','-','_')).rstrip() + ".png"
+            # --- MODIFIED: Use new helper to generate structured filename ---
+            output_filename = self._generate_filename(name)
+            self.logger.info(f"Generated output filename: '{output_filename}'")
 
             if self.upload_to_server:
                 # --- UPLOAD TO SERVER PATH ---
