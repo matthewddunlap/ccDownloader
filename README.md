@@ -20,3 +20,9 @@ python3 ccDownloader.py --headless --auto-fit-art --auto-fit-set-symbol --frame 
 ```
 python3 ccDownloader.py --headless --auto-fit-art --auto-fit-set-symbol --frame m15ub --output card_images/m15ub --file myDeck.cardcojurer --url http://mtgproxy:4242
 ```
+
+### Errors
+If ccDownloader fails to capture the canvas for a card it will be listed at the end of the log. For each card copy it's name (which includes the set and collector number delimited with underscores) in to a new file names keylist.txt and put each on a new line. Then execute the following to generate a new `.cardconjurer` file to re-download the missing card images.
+```
+jq --argfile keys <(jq -R . keylist.txt | jq -s 'map(.)') ' .[] | select(.key as $k | $keys | index($k)) ' myDeck.cardconjurer | jq -s . > myDeck-failed.cardconjurer
+```
