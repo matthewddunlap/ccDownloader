@@ -1,6 +1,6 @@
 # --- ccDownloader.py ---
 """
-Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v7.0 - Web Server Upload)
+Card Conjurer Selenium Downloader - Smart Canvas Capture Version (v7.1 - Auto-Retry File Generation)
 
 Captures card images directly from the canvas using toDataURL.
 Can either save images to a local directory (via a temporary zip) or upload them directly to a WebDAV server.
@@ -10,6 +10,7 @@ Includes:
 - Optional features for art and set symbol manipulation.
 - Set Symbol Override now always uses live rarity, populating separate fields.
 - Filename format: [name-with-dashes]_[set]_[number].png
+- NEW: Automatically generates a .cardconjurer file for any failed cards, ready for a retry run.
 """
 
 import os
@@ -23,9 +24,9 @@ from pathlib import Path
 import zipfile
 import base64 
 import hashlib 
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
-# --- NEW: Add requests dependency for uploading ---
+# --- Add requests dependency for uploading ---
 # Note: This script now requires the 'requests' library for the upload feature.
 # Install it using: pip install requests
 try:
@@ -34,7 +35,7 @@ except ImportError:
     print("Error: The 'requests' library is required for the --upload-to-server feature.")
     print("Please install it using: pip install requests")
     sys.exit(1)
-# --- END NEW ---
+# --- END ---
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -44,7 +45,7 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
-# --- NEW: Web Server Upload Functions (from MtgPng2Pdf.py) ---
+# --- Web Server Upload Functions (from MtgPng2Pdf.py) ---
 def check_server_file_exists(url: str, debug: bool = False) -> bool:
     """Check if a file already exists at a given URL using a HEAD request."""
     if not url:
@@ -91,10 +92,10 @@ def upload_file_to_server(url: str, file_bytes: bytes, mime_type: str, debug: bo
         if e.response is not None:
             print(f"Server Response Body: {e.response.text}")
         return False
-# --- END NEW ---
+# --- END ---
 
 class CardConjurerDownloader:
-    # --- MODIFIED: __init__ to accept server args ---
+    # --- MODIFIED: __init__ to accept server args and new attributes ---
     def __init__(self, url="https://cardconjurer.app:443", output_dir=None, log_level=logging.INFO, **kwargs):
         self.url = url
         self.output_dir = output_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CardConjurer")
@@ -103,12 +104,16 @@ class CardConjurerDownloader:
         self.parsed_card_data_map: Dict[str, Dict] = {}
         self._current_active_tab: Optional[str] = None 
 
+        # --- NEW: Attributes for failed card file generation ---
+        self.full_card_list_from_file: List[Dict] = []
+        self.failed_card_keys: List[str] = []
+
         # Optional features
         self.auto_fit_art_enabled = False
         self.auto_fit_set_symbol_enabled = False
         self.set_symbol_override_code = None
 
-        # --- NEW: Server upload attributes ---
+        # --- Server upload attributes ---
         self.upload_to_server = kwargs.get('upload_to_server', False)
         self.image_server_base_url = kwargs.get('image_server_base_url', None)
         self.output_server_path = kwargs.get('output_server_path', None)
@@ -126,7 +131,7 @@ class CardConjurerDownloader:
 
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         self.setup_logging(log_level)
-        self.logger.info(f"Initialized CC Downloader (v7.0 - Web Server Upload)")
+        self.logger.info(f"Initialized CC Downloader (v7.1 - Auto-Retry File Generation)")
         self.logger.info(f"URL: {self.url}")
         if self.upload_to_server:
             self.logger.info(f"UPLOAD MODE: Enabled. Target server: {self.image_server_base_url}, Path: {self.output_server_path}")
@@ -142,13 +147,13 @@ class CardConjurerDownloader:
         dt_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         s_fmt = '%(asctime)s - %(levelname)s - %(message)s'
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_fn = log_dir / f"cc_v7.0_server_upload_{ts}.log"
+        log_fn = log_dir / f"cc_v7.1_retry_file_{ts}.log"
         fh = logging.FileHandler(log_fn); fh.setLevel(logging.DEBUG); fh.setFormatter(logging.Formatter(dt_fmt))
         ch = logging.StreamHandler(sys.stdout); ch.setLevel(log_level); ch.setFormatter(logging.Formatter(s_fmt))
         self.logger.addHandler(fh); self.logger.addHandler(ch)
         self.logger.info(f"Logging to: {log_fn}")
 
-    # ... (All other methods from setup_driver to prime_rendering_quirks remain unchanged) ...
+    # ... (setup_driver to navigate_to_card_conjurer are unchanged) ...
     def setup_driver(self, headless=False):
         self.logger.info(f"Setting up Chrome driver (headless={headless}) in INCOGNITO mode.")
         chrome_options = Options()
@@ -204,9 +209,11 @@ class CardConjurerDownloader:
             self.logger.info("Canvas found, page ready."); self._current_active_tab="art"; return True 
         self.logger.error("Canvas not found."); return False
 
+    # --- MODIFIED: Now also stores the full original card list ---
     def _parse_cardconjurer_file_content(self, file_path: str) -> bool:
         self.logger.info(f"Parsing .cardconjurer file content from: {file_path}")
         self.parsed_card_data_map.clear()
+        self.full_card_list_from_file.clear()
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 full_data_from_file = json.load(f) 
@@ -219,6 +226,9 @@ class CardConjurerDownloader:
             else:
                 self.logger.error(f"Unsupported .cardconjurer structure in {file_path}. Expected a JSON list of card objects or a single card object with a 'key'.")
                 return False
+
+            # --- NEW: Store the original full list for potential filtering later ---
+            self.full_card_list_from_file = card_list_to_parse
 
             name_key_in_file = "key" # As per example, this is the main card identifier
 
@@ -242,6 +252,7 @@ class CardConjurerDownloader:
         except Exception as e:
             self.logger.error(f"Error reading/parsing {file_path}: {e}", exc_info=True); return False
 
+    # ... (upload_cardconjurer_file to _generate_filename are unchanged) ...
     def upload_cardconjurer_file(self, file_path: str) -> bool:
         self.logger.info(f"Starting file upload process for: {file_path}")
         if not os.path.exists(file_path): 
@@ -668,13 +679,14 @@ class CardConjurerDownloader:
         self._current_active_tab = "art" 
         return final_first_card_hash
 
-    # --- MODIFIED: Renamed and refactored for dual output modes ---
+    # --- MODIFIED: Now tracks failed card keys ---
     def process_and_output_all_cards(self) -> bool:
         if self.upload_to_server:
             self.logger.info("Starting image processing for SERVER UPLOAD.")
         else:
             self.logger.info("Starting image processing for LOCAL DIRECTORY output (via temp ZIP).")
 
+        self.failed_card_keys = [] # Reset the list for this run
         current_canvas_hash: Optional[str] = None 
         if not self.cards: self.logger.info("Card list empty, fetching..."); self.get_saved_cards()
         if not self.cards: self.logger.error("No cards to process."); return False
@@ -688,12 +700,15 @@ class CardConjurerDownloader:
             is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
             
             if not is_first_card_and_was_successfully_primed:
-                if not self._navigate_to_creator_tab("import"): f_cards_info.append(f"{name}(import nav fail)"); continue
-                if not self.load_card(name): f_cards_info.append(f"{name}(load fail)"); continue
+                if not self._navigate_to_creator_tab("import"):
+                    f_cards_info.append(f"{name}(import nav fail)"); self.failed_card_keys.append(name); continue
+                if not self.load_card(name):
+                    f_cards_info.append(f"{name}(load fail)"); self.failed_card_keys.append(name); continue
             else:
                 self.logger.info(f"Skipping explicit load for '{name}' (handled by priming). Ensuring 'art' tab.")
                 if self._current_active_tab != "art": 
-                    if not self._navigate_to_creator_tab("art"): f_cards_info.append(f"{name}(art tab nav fail post-prime)"); continue
+                    if not self._navigate_to_creator_tab("art"):
+                        f_cards_info.append(f"{name}(art tab nav fail post-prime)"); self.failed_card_keys.append(name); continue
             
             # Apply optional features
             if self.set_symbol_override_code and not self.apply_set_symbol_override(self.set_symbol_override_code): self.logger.warning(f"Failed set symbol override for '{name}'.")
@@ -704,21 +719,21 @@ class CardConjurerDownloader:
             capture_tab = "art" 
             if self._current_active_tab != capture_tab: 
                 self.logger.info(f"Ensuring on '{capture_tab}' tab for canvas capture of '{name}'.")
-                if not self._navigate_to_creator_tab(capture_tab): f_cards_info.append(f"{name}(capture tab nav fail)"); continue
+                if not self._navigate_to_creator_tab(capture_tab):
+                    f_cards_info.append(f"{name}(capture tab nav fail)"); self.failed_card_keys.append(name); continue
             
             img_bytes, new_hash_after_capture = self.capture_card_image_data_from_canvas(name, current_canvas_hash)
             current_canvas_hash = new_hash_after_capture 
             
             if not img_bytes:
                 f_cards_info.append(f"{name}(capture fail)")
+                self.failed_card_keys.append(name)
                 continue
 
-            # --- MODIFIED: Use new helper to generate structured filename ---
             output_filename = self._generate_filename(name)
             self.logger.info(f"Generated output filename: '{output_filename}'")
 
             if self.upload_to_server:
-                # --- UPLOAD TO SERVER PATH ---
                 path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
                 full_path = "/".join(p for p in path_parts if p)
                 if not full_path.startswith('/'): full_path = '/' + full_path
@@ -733,11 +748,10 @@ class CardConjurerDownloader:
                     s_cards += 1
                 else:
                     f_cards_info.append(f"{name}(upload fail)")
+                    self.failed_card_keys.append(name)
             else:
-                # --- LOCAL DIRECTORY PATH (original logic) ---
-                # This part is deferred until after the loop for local mode
-                f_cards_info.append({'name': output_filename, 'bytes': img_bytes}) # Store for zipping later
-                s_cards += 1 # Tentatively count as success
+                f_cards_info.append({'name': output_filename, 'bytes': img_bytes})
+                s_cards += 1
 
         # --- Post-loop processing for local mode ---
         if not self.upload_to_server:
@@ -750,7 +764,7 @@ class CardConjurerDownloader:
                 return False
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_temp_fp = Path(self.output_dir) / f"CC_Temp_v7.0_{ts}.zip"
+            zip_temp_fp = Path(self.output_dir) / f"CC_Temp_v7.1_{ts}.zip"
             self.logger.info(f"Creating temporary ZIP for local extraction: {zip_temp_fp}")
             try:
                 with zipfile.ZipFile(zip_temp_fp, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -776,8 +790,44 @@ class CardConjurerDownloader:
         if f_cards_info: self.logger.warning(f"Failed ops ({len(f_cards_info)}): {', '.join(f_cards_info)}")
         return s_cards > 0
 
+    # --- NEW: Method to generate a .cardconjurer file for failed cards ---
+    def _write_failed_cards_file(self, original_filepath: str):
+        """Filters the original input file to create a new file containing only failed cards."""
+        if not self.failed_card_keys:
+            self.logger.info("No failed cards were recorded, skipping failed-file generation.")
+            return
+
+        if not self.full_card_list_from_file:
+            self.logger.error("Cannot write failed cards file: original card data was not loaded or is empty.")
+            return
+
+        unique_failed_keys = sorted(list(set(self.failed_card_keys)))
+        self.logger.info(f"Found {len(unique_failed_keys)} unique failed cards. Generating a new .cardconjurer file for them.")
+
+        failed_keys_set = set(unique_failed_keys)
+        failed_card_objects = [
+            card_obj for card_obj in self.full_card_list_from_file
+            if card_obj.get("key") in failed_keys_set
+        ]
+
+        if not failed_card_objects:
+            self.logger.warning(f"Found {len(unique_failed_keys)} failed card keys, but couldn't match them to objects in the original file. No file will be written.")
+            return
+
+        p = Path(original_filepath)
+        failed_filename = f"{p.stem}-failed{p.suffix}"
+        failed_filepath = p.with_name(failed_filename)
+
+        try:
+            with open(failed_filepath, 'w', encoding='utf-8') as f:
+                json.dump(failed_card_objects, f, indent=4)
+            self.logger.info(f"Successfully wrote {len(failed_card_objects)} failed card objects to: {failed_filepath}")
+        except Exception as e:
+            self.logger.error(f"Failed to write failed cards file to {failed_filepath}: {e}", exc_info=True)
+
+    # --- MODIFIED: Calls the new method to write failed cards file ---
     def run(self, cardconjurer_file=None, action="zip", headless=False, frame=None, args_for_optional_features=None):
-        self.logger.info(f"Run (v7.0) action:{action} headless:{headless} frame:{frame}")
+        self.logger.info(f"Run (v7.1) action:{action} headless:{headless} frame:{frame}")
         if args_for_optional_features:
             self.auto_fit_art_enabled = getattr(args_for_optional_features, 'auto_fit_art', False)
             self.auto_fit_set_symbol_enabled = getattr(args_for_optional_features, 'auto_fit_set_symbol', False)
@@ -814,7 +864,6 @@ class CardConjurerDownloader:
                 if not self.cards: self.get_saved_cards() 
                 if not self.cards: self.logger.error("No cards to process."); return 
                 
-                # --- MODIFIED: Call the new refactored function ---
                 output_successful = self.process_and_output_all_cards() 
                 
                 if output_successful: 
@@ -824,6 +873,12 @@ class CardConjurerDownloader:
                         self.logger.info(f"Image extraction complete. Files are in: {self.output_dir}")
                 else: 
                     self.logger.error("Image processing and output failed or no images were processed.")
+            
+            # --- NEW: Generate file for failed cards ---
+            if cardconjurer_file:
+                self._write_failed_cards_file(cardconjurer_file)
+            # --- END NEW ---
+
         except Exception as e: self.logger.error(f"Unhandled run err: {e}",exc_info=True)
         finally:
             if self.driver:
@@ -833,23 +888,20 @@ class CardConjurerDownloader:
                 self.driver.quit(); self.logger.info("Browser closed.")
 
 def main():
-    p = argparse.ArgumentParser(description='Card Conjurer Downloader - v7.0 with Local and Web Server Output')
+    p = argparse.ArgumentParser(description='Card Conjurer Downloader - v7.1 with Local/Web Server Output and Auto-Retry File')
     p.add_argument('--file','-f',required=True,help='.cardconjurer file to load')
     p.add_argument('--url',default='https://cardconjurer.app:443',help='Card Conjurer URL')
-    # --- MODIFIED: Renamed --output to --output-dir for clarity ---
     p.add_argument('--output-dir',default=None,help='Local output directory for extracted images and logs. Used if --upload-to-server is not specified.')
     p.add_argument('--headless',action='store_true',help='Run in headless mode')
     p.add_argument('--frame',choices=['7th','seventh','8th','eighth','m15','ub'],help='Auto frame setting')
     p.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'],help='Console logging level')
     
-    # --- Optional Features Group ---
     opt_group = p.add_argument_group('Optional Card-Specific Features')
     opt_group.add_argument('--auto-fit-art', action='store_true', help='Enable Auto Fit Art feature.')
     opt_group.add_argument('--auto-fit-set-symbol', action='store_true', help='Enable Reset Set Symbol (auto fit) feature.')
     opt_group.add_argument('--set-symbol-override', type=str, default=None, metavar='CODE', 
                        help='Override set symbol with CODE (e.g., "MH2"). Live rarity from Collector tab will be used.')
 
-    # --- NEW: Web Server Upload Options ---
     webserver_upload_group = p.add_argument_group('Web Server Upload Options')
     webserver_upload_group.add_argument(
         "--upload-to-server", action="store_true",
@@ -871,7 +923,6 @@ def main():
     a = p.parse_args()
     if not os.path.exists(a.file): print(f"Error: File not found: {a.file}");sys.exit(1)
     
-    # --- NEW: Validation for upload arguments ---
     if a.upload_to_server:
         if not a.image_server_base_url:
             p.error("--upload-to-server requires --image-server-base-url.")
@@ -880,7 +931,6 @@ def main():
 
     log_lvl_val = getattr(logging, a.log_level.upper(), logging.INFO)
     
-    # --- MODIFIED: Pass new arguments to the downloader class ---
     downloader = CardConjurerDownloader(
         url=a.url,
         output_dir=a.output_dir,

@@ -22,7 +22,7 @@ python3 ccDownloader.py --headless --auto-fit-art --auto-fit-set-symbol --frame 
 ```
 
 ### Errors
-If ccDownloader fails to capture the canvas for a card it will be listed at the end of the log. For each card copy it's name (which includes the set and collector number delimited with underscores) in to a new file names keylist.txt and put each on a new line. Then execute the following to generate a new `.cardconjurer` file to re-download the missing card images.
-```
-jq --argfile keys <(jq -R . keylist.txt | jq -s 'map(.)') ' .[] | select(.key as $k | $keys | index($k)) ' myDeck.cardconjurer | jq -s . > myDeck-failed.cardconjurer
-```
+If ccDownloader fails to capture the canvas for a card (or any other errors prior) it will be listed at the end of the log.  The card name includes the set and collector number delimited with underscores.
+
+The script will also output a new `.cardconjurer` containg just the failed cards ready to be input for another run of ccDownloader. The new file will be in the same directory as the original input file with the same name with `-failed' appended. For example for the input file `myDeck.cardconjurer` if there are any errors a new file `myDeck-failed.cardconjurer` will be created.
+
