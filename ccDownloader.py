@@ -120,8 +120,10 @@ class CardConjurerDownloader:
         self.overwrite_server_file = kwargs.get('overwrite_server_file', False)
         self.debug_mode = log_level == logging.DEBUG
 
+        upload_wait_timeout = kwargs.get('upload_timeout', 60.0)
+
         self.delays = {
-            'page_load': 0.1, 'tab_switch': 0.1, 'file_upload_wait': 10.0, 
+            'page_load': 0.1, 'tab_switch': 0.1, 'file_upload_wait': float(upload_wait_timeout), 
             'card_load_js_ops': 0.2, 'frame_set': 0.1, 'element_wait': 3.0, 
             'js_init': 0.1, 'canvas_stabilize_timeout': 15.0,
             'canvas_stability_checks': 3, 'canvas_stability_interval': 0.33,
@@ -895,7 +897,7 @@ def main():
     p.add_argument('--headless',action='store_true',help='Run in headless mode')
     p.add_argument('--frame',choices=['7th','seventh','8th','eighth','m15','ub'],help='Auto frame setting')
     p.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'],help='Console logging level')
-    
+    p.add_argument('--upload-timeout', type=int, default=60, help='Timeout in seconds to wait for a large .cardconjurer file to load (default: 60)')
     opt_group = p.add_argument_group('Optional Card-Specific Features')
     opt_group.add_argument('--auto-fit-art', action='store_true', help='Enable Auto Fit Art feature.')
     opt_group.add_argument('--auto-fit-set-symbol', action='store_true', help='Enable Reset Set Symbol (auto fit) feature.')
@@ -938,7 +940,8 @@ def main():
         upload_to_server=a.upload_to_server,
         image_server_base_url=a.image_server_base_url,
         output_server_path=a.output_server_path,
-        overwrite_server_file=a.overwrite_server_file
+        overwrite_server_file=a.overwrite_server_file,
+        upload_timeout=a.upload_timeout
     )
     downloader.run(cardconjurer_file=a.file,headless=a.headless,frame=a.frame, args_for_optional_features=a)
 
