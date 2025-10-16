@@ -681,24 +681,53 @@ class CardConjurerDownloader:
         self._current_active_tab = "art" 
         return final_first_card_hash
 
-    # --- MODIFIED: Now tracks failed card keys ---
     def process_and_output_all_cards(self) -> bool:
         if self.upload_to_server:
             self.logger.info("Starting image processing for SERVER UPLOAD.")
         else:
-            self.logger.info("Starting image processing for LOCAL DIRECTORY output (via temp ZIP).")
-
+            self.logger.info("Starting image processing for LOCAL DIRECTORY output.")
+    
         self.failed_card_keys = [] # Reset the list for this run
         current_canvas_hash: Optional[str] = None 
         if not self.cards: self.logger.info("Card list empty, fetching..."); self.get_saved_cards()
         if not self.cards: self.logger.error("No cards to process."); return False
         
         current_canvas_hash = self.prime_rendering_quirks()
-        s_cards, f_cards_info = 0, []
-
+        
+        s_cards, skipped_cards = 0, 0
+        f_cards_info = []
+        
+        # This list will hold successful local captures before they are written to a zip file
+        successful_local_captures = []
+    
         # --- Main processing loop ---
         for i, name in enumerate(self.cards):
-            self.logger.info(f"Processing {i+1}/{len(self.cards)}: '{name}'")
+            self.logger.info(f"--- Processing {i+1}/{len(self.cards)}: '{name}' ---")
+            
+            # --- NEW PRE-CHECK LOGIC ---
+            # Step 1: Generate the filename first to see if we even need to do any work.
+            output_filename = self._generate_filename(name)
+            
+            # Step 2: Check for existence if overwrite is not enabled.
+            if not self.overwrite_server_file:
+                if self.upload_to_server:
+                    path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
+                    full_path = "/".join(p for p in path_parts if p)
+                    if not full_path.startswith('/'): full_path = '/' + full_path
+                    check_url = f"{self.image_server_base_url.rstrip('/')}{full_path}"
+                    
+                    if check_server_file_exists(check_url, self.debug_mode):
+                        self.logger.info(f"Skipping '{output_filename}', file exists on server.")
+                        skipped_cards += 1
+                        continue # Skip to the next card in the loop
+                else: # Local directory mode
+                    local_filepath = os.path.join(self.output_dir, output_filename)
+                    if os.path.exists(local_filepath):
+                        self.logger.info(f"Skipping '{output_filename}', file exists in output directory.")
+                        skipped_cards += 1
+                        continue # Skip to the next card in the loop
+            # --- END OF PRE-CHECK LOGIC ---
+            
             is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
             
             if not is_first_card_and_was_successfully_primed:
@@ -731,20 +760,14 @@ class CardConjurerDownloader:
                 f_cards_info.append(f"{name}(capture fail)")
                 self.failed_card_keys.append(name)
                 continue
-
-            output_filename = self._generate_filename(name)
-            self.logger.info(f"Generated output filename: '{output_filename}'")
-
+    
+            self.logger.info(f"Successfully rendered and captured image for '{output_filename}'")
+    
             if self.upload_to_server:
                 path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
                 full_path = "/".join(p for p in path_parts if p)
                 if not full_path.startswith('/'): full_path = '/' + full_path
                 upload_url = f"{self.image_server_base_url.rstrip('/')}{full_path}"
-
-                if not self.overwrite_server_file and check_server_file_exists(upload_url, self.debug_mode):
-                    self.logger.warning(f"Skipping upload for '{output_filename}', file exists on server. Use --overwrite-server-file.")
-                    f_cards_info.append(f"{name}(exists on server)")
-                    continue
                 
                 if upload_file_to_server(upload_url, img_bytes, 'image/png', self.debug_mode):
                     s_cards += 1
@@ -752,32 +775,31 @@ class CardConjurerDownloader:
                     f_cards_info.append(f"{name}(upload fail)")
                     self.failed_card_keys.append(name)
             else:
-                f_cards_info.append({'name': output_filename, 'bytes': img_bytes})
+                # For local mode, collect successful captures to be zipped later
+                successful_local_captures.append({'name': output_filename, 'bytes': img_bytes})
                 s_cards += 1
-
-        # --- Post-loop processing for local mode ---
+    
+        # --- Post-loop Summary and Output ---
+        self.logger.info(f"Process complete. Success: {s_cards}, Failed: {len(f_cards_info)}, Skipped: {skipped_cards}.")
+    
         if not self.upload_to_server:
-            successful_local_cards = [c for c in f_cards_info if isinstance(c, dict)]
-            failed_local_cards = [c for c in f_cards_info if isinstance(c, str)]
-            
-            if not successful_local_cards:
-                self.logger.warning("No cards were successfully captured for local saving.")
-                if failed_local_cards: self.logger.warning(f"Failed ops ({len(failed_local_cards)}): {', '.join(failed_local_cards)}")
-                return False
-
+            if not successful_local_captures:
+                self.logger.warning("No new cards were captured for local saving.")
+                return len(self.failed_card_keys) == 0 and skipped_cards > 0 # Return True if we only skipped/failed nothing
+    
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             zip_temp_fp = Path(self.output_dir) / f"CC_Temp_v7.1_{ts}.zip"
             self.logger.info(f"Creating temporary ZIP for local extraction: {zip_temp_fp}")
             try:
                 with zipfile.ZipFile(zip_temp_fp, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for card_data in successful_local_cards:
+                    for card_data in successful_local_captures:
                         zf.writestr(card_data['name'], card_data['bytes'])
                 
-                self.logger.info(f"Extracting {len(successful_local_cards)} images from {zip_temp_fp} to {self.output_dir}...")
+                self.logger.info(f"Extracting {len(successful_local_captures)} images from {zip_temp_fp} to {self.output_dir}...")
                 with zipfile.ZipFile(zip_temp_fp, 'r') as zf_read:
                     zf_read.extractall(self.output_dir)
-                self.logger.info(f"Successfully extracted {len(successful_local_cards)} image(s).")
-
+                self.logger.info(f"Successfully extracted {len(successful_local_captures)} new image(s).")
+    
             except Exception as e_zip:
                 self.logger.error(f"Temp ZIP/Extraction error: {e_zip}", exc_info=True)
                 return False
@@ -785,12 +807,10 @@ class CardConjurerDownloader:
                 if os.path.exists(zip_temp_fp):
                     try: os.remove(zip_temp_fp); self.logger.info(f"Deleted temp ZIP: {zip_temp_fp}")
                     except Exception as e_del: self.logger.error(f"Error deleting temp ZIP: {e_del}")
-            
-            if failed_local_cards: self.logger.warning(f"Failed ops ({len(failed_local_cards)}): {', '.join(failed_local_cards)}")
-            return len(successful_local_cards) > 0
-
-        if f_cards_info: self.logger.warning(f"Failed ops ({len(f_cards_info)}): {', '.join(f_cards_info)}")
-        return s_cards > 0
+    
+        if f_cards_info: self.logger.warning(f"Failed ops ({len(f_cards_info)}): {', '.join(str(f) for f in f_cards_info)}")
+    
+        return s_cards > 0 or (skipped_cards > 0 and not f_cards_info)
 
     # --- NEW: Method to generate a .cardconjurer file for failed cards ---
     def _write_failed_cards_file(self, original_filepath: str):
@@ -919,7 +939,7 @@ def main():
     )
     webserver_upload_group.add_argument(
         "--overwrite-server-file", action="store_true",
-        help="If a file with the same name exists on the server, overwrite it. Default is to fail."
+        help="If a file with the same name exists on the server or in the local output directory, overwrite it. Default is to skip."
     )
     
     a = p.parse_args()
