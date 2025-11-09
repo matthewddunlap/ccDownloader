@@ -528,7 +528,9 @@ class CardConjurerDownloader:
         
         Note: card_name parameter is the dropdown identifier, but we extract the actual
         card name from the CardConjurer data structure to avoid duplication.
+        Handles CardConjurer duplicate naming convention (e.g., 'Card Name (1)').
         """
+        import re
         # Default values if data is missing
         set_code_default = 'noset'
         collector_number_default = 'nonum'
@@ -537,9 +539,16 @@ class CardConjurerDownloader:
         set_code = set_code_default
         collector_number = collector_number_default
         actual_card_name = actual_card_name_default
-    
+        
+        # Handle CardConjurer's duplicate naming (e.g., "My Card (1)") by stripping the suffix
+        # to find the original card data, which is what we actually want.
+        card_name_for_lookup = re.sub(r'\s*\(\d+\)$', '', card_name).strip()
+        if card_name_for_lookup != card_name:
+            self.logger.debug(f"Mapped duplicate UI name '{card_name}' to '{card_name_for_lookup}' for data lookup.")
+        
         # Retrieve card-specific data from the parsed map
-        card_data = self.parsed_card_data_map.get(card_name)
+        card_data = self.parsed_card_data_map.get(card_name_for_lookup)
+        
         if card_data:
             # Extract actual card name from CardConjurer data structure
             text_data = card_data.get('text', {})
@@ -552,24 +561,26 @@ class CardConjurerDownloader:
             
             self.logger.debug(f"For dropdown '{card_name}': actual name='{actual_card_name}', set='{set_code}', num='{collector_number}'.")
         else:
-            self.logger.warning(f"Could not find parsed data for '{card_name}'. Using dropdown identifier as fallback.")
-            # Fallback: use the dropdown identifier, but try to clean it if it's already formatted
-            if '_' in card_name:
-                # Assume it's already in format "name_set_number" and extract just the name part
-                actual_card_name = card_name.split('_')[0]
-                self.logger.debug(f"Extracted name part from formatted identifier: '{actual_card_name}'")
+            self.logger.warning(f"Could not find parsed data for '{card_name}' (lookup: '{card_name_for_lookup}'). Using dropdown identifier as fallback.")
+            # Fallback: use the dropdown identifier (the version without '(1)'), but try to clean it if it's already formatted
+            if '_' in card_name_for_lookup:
+                # Assume it's already in format "name_set_number"
+                parts = card_name_for_lookup.split('_')
+                actual_card_name = parts[0]
+                if len(parts) > 1: set_code = parts[1]
+                if len(parts) > 2: collector_number = parts[2]
+                self.logger.debug(f"Extracted parts from identifier: Name='{actual_card_name}', Set='{set_code}', Num='{collector_number}'")
             else:
-                actual_card_name = card_name
-        
+                actual_card_name = card_name_for_lookup
+
         # Sanitize actual card name: lowercase, replace spaces with dashes, remove special characters
-        import re
         clean_name = re.sub(r'[^\w\s-]', '', actual_card_name.lower())  # Remove special chars except spaces and dashes
         clean_name = re.sub(r'\s+', '-', clean_name.strip())           # Replace spaces with dashes
         clean_name = re.sub(r'-+', '-', clean_name)                    # Collapse multiple dashes
         
         # Clean up set code and collector number
         set_code_clean = str(set_code).lower().strip()
-        collector_number_clean = str(collector_number).lower().strip()
+        collector_number_clean = str(collector_number).strip()
     
         # Assemble the filename parts, avoiding empty parts which could cause double delimiters
         parts = [clean_name]
