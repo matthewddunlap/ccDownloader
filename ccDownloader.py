@@ -44,6 +44,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
 
 # --- Web Server Upload Functions (from MtgPng2Pdf.py) ---
 def check_server_file_exists(url: str, debug: bool = False) -> bool:
@@ -118,6 +119,7 @@ class CardConjurerDownloader:
         self.image_server_base_url = kwargs.get('image_server_base_url', None)
         self.output_server_path = kwargs.get('output_server_path', None)
         self.overwrite_server_file = kwargs.get('overwrite_server_file', False)
+        self.apply_white_border_enabled = kwargs.get('apply_white_border', False)
         self.debug_mode = log_level == logging.DEBUG
 
         upload_wait_timeout = kwargs.get('upload_timeout', 60.0)
@@ -448,6 +450,52 @@ class CardConjurerDownloader:
         
         self.logger.info("Set symbol override ops complete. Waiting for fetch..."); time.sleep(self.delays['set_symbol_fetch_wait']); return True
 
+    def apply_white_border(self) -> bool:
+        self.logger.info("Applying white border frame (v3)...")
+        # User confirms the tab is named 'frame'.
+        if not self._navigate_to_creator_tab("frame"):
+            self.logger.error("Failed to navigate to 'Frame' tab to apply white border.")
+            return False
+
+        try:
+            actions = ActionChains(self.driver)
+
+            # 1. Double-click the white border frame thumbnail
+            self.logger.debug("Searching for the white border frame thumbnail...")
+            frame_thumb_selector = "img[src*='/img/frames/whiteThumb.png']"
+            frame_thumb_element = self.wait_for_clickable(frame_thumb_selector, timeout=5)
+
+            if not frame_thumb_element:
+                self.logger.error(f"Could not find or click the white border frame thumbnail with selector: {frame_thumb_selector}")
+                return False
+            
+            self.logger.info("Found white border thumbnail. Double-clicking it.")
+            actions.double_click(frame_thumb_element).perform()
+            time.sleep(0.5) # Wait for any potential UI update
+
+            # 2. Double-click the mask
+            self.logger.debug("Searching for the mask thumbnail...")
+            # The puppeteer script suggests a generic selector, implying we just need to click the first/any mask there.
+            mask_selector = "#mask-picker img"
+            mask_element = self.wait_for_clickable(mask_selector, timeout=5)
+
+            if not mask_element:
+                self.logger.error(f"Could not find or click the mask thumbnail with selector: {mask_selector}")
+                return False
+
+            self.logger.info("Found mask thumbnail. Double-clicking it.")
+            # Create a new ActionChains object for the second action, which is a good practice.
+            actions_mask = ActionChains(self.driver)
+            actions_mask.double_click(mask_element).perform()
+            
+            time.sleep(self.delays['frame_set'] + 0.5) # Wait for frame to apply
+            self.logger.info("White border and mask applied successfully.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"An error occurred while applying the white border: {e}", exc_info=True)
+            return False
+
     def wait_for_canvas_change_and_stabilization(self, initial_data_url_hash: Optional[str]) -> Optional[str]:
         self.logger.debug(f"Waiting for canvas to change (from hash: {str(initial_data_url_hash)[:10] if initial_data_url_hash else 'None'}) and stabilize...")
         start_time = time.perf_counter(); timeout = self.delays['canvas_stabilize_timeout']
@@ -757,6 +805,9 @@ class CardConjurerDownloader:
             if self.auto_fit_set_symbol_enabled and not self.apply_auto_fit_set_symbol(): self.logger.warning(f"Failed auto fit set symbol for '{name}'.")
             if self.auto_fit_art_enabled and not self.apply_auto_fit_art(): self.logger.warning(f"Failed auto fit art for '{name}'.")
             
+            # Apply white border last, as it's a final frame modification
+            if self.apply_white_border_enabled and not self.apply_white_border(): self.logger.warning(f"Failed to apply white border for '{name}'.")
+            
             # Capture canvas
             capture_tab = "art" 
             if self._current_active_tab != capture_tab: 
@@ -865,9 +916,11 @@ class CardConjurerDownloader:
             self.auto_fit_art_enabled = getattr(args_for_optional_features, 'auto_fit_art', False)
             self.auto_fit_set_symbol_enabled = getattr(args_for_optional_features, 'auto_fit_set_symbol', False)
             self.set_symbol_override_code = getattr(args_for_optional_features, 'set_symbol_override', None)
+            self.apply_white_border_enabled = getattr(args_for_optional_features, 'white_border', False)
             if self.auto_fit_art_enabled: self.logger.info("Opt Feature: Auto Fit Art ENABLED")
             if self.auto_fit_set_symbol_enabled: self.logger.info("Opt Feature: Auto Fit Set Symbol (Reset) ENABLED")
             if self.set_symbol_override_code: self.logger.info(f"Opt Feature: Set Symbol Override with code '{self.set_symbol_override_code}' (will use live rarity).")
+            if self.apply_white_border_enabled: self.logger.info("Opt Feature: Apply White Border ENABLED")
         try:
             self.setup_driver(headless=headless) 
             if not self.navigate_to_card_conjurer(): return 
@@ -934,6 +987,7 @@ def main():
     opt_group.add_argument('--auto-fit-set-symbol', action='store_true', help='Enable Reset Set Symbol (auto fit) feature.')
     opt_group.add_argument('--set-symbol-override', type=str, default=None, metavar='CODE', 
                        help='Override set symbol with CODE (e.g., "MH2"). Live rarity from Collector tab will be used.')
+    opt_group.add_argument('--white-border', action='store_true', help='Apply the white border frame change.')
 
     webserver_upload_group = p.add_argument_group('Web Server Upload Options')
     webserver_upload_group.add_argument(
@@ -972,7 +1026,8 @@ def main():
         image_server_base_url=a.image_server_base_url,
         output_server_path=a.output_server_path,
         overwrite_server_file=a.overwrite_server_file,
-        upload_timeout=a.upload_timeout
+        upload_timeout=a.upload_timeout,
+        apply_white_border=a.white_border
     )
     downloader.run(cardconjurer_file=a.file,headless=a.headless,frame=a.frame, args_for_optional_features=a)
 
