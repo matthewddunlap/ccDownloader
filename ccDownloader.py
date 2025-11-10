@@ -24,6 +24,7 @@ from pathlib import Path
 import zipfile
 import base64 
 import hashlib 
+import re
 from typing import Optional, Tuple, Dict, List
 
 # --- Add requests dependency for uploading ---
@@ -120,6 +121,7 @@ class CardConjurerDownloader:
         self.output_server_path = kwargs.get('output_server_path', None)
         self.overwrite_server_file = kwargs.get('overwrite_server_file', False)
         self.apply_white_border_enabled = kwargs.get('apply_white_border', False)
+        self.skip_basic_land_enabled = kwargs.get('skip_basic_land', False)
         self.debug_mode = log_level == logging.DEBUG
 
         upload_wait_timeout = kwargs.get('upload_timeout', 60.0)
@@ -763,6 +765,14 @@ class CardConjurerDownloader:
         for i, name in enumerate(self.cards):
             self.logger.info(f"--- Processing {i+1}/{len(self.cards)}: '{name}' ---")
             
+            if self.skip_basic_land_enabled:
+                basic_lands = ["forest", "island", "mountain", "plains", "swamp"]
+                card_name_for_check = re.sub(r'\s*\(\d+\)$', '', name).strip()
+                if card_name_for_check.lower() in basic_lands:
+                    self.logger.info(f"Skipping basic land '{name}' due to --skip-basic-land flag.")
+                    skipped_cards += 1
+                    continue
+
             # --- NEW PRE-CHECK LOGIC ---
             # Step 1: Generate the filename first to see if we even need to do any work.
             output_filename = self._generate_filename(name)
@@ -917,10 +927,12 @@ class CardConjurerDownloader:
             self.auto_fit_set_symbol_enabled = getattr(args_for_optional_features, 'auto_fit_set_symbol', False)
             self.set_symbol_override_code = getattr(args_for_optional_features, 'set_symbol_override', None)
             self.apply_white_border_enabled = getattr(args_for_optional_features, 'white_border', False)
+            self.skip_basic_land_enabled = getattr(args_for_optional_features, 'skip_basic_land', False)
             if self.auto_fit_art_enabled: self.logger.info("Opt Feature: Auto Fit Art ENABLED")
             if self.auto_fit_set_symbol_enabled: self.logger.info("Opt Feature: Auto Fit Set Symbol (Reset) ENABLED")
             if self.set_symbol_override_code: self.logger.info(f"Opt Feature: Set Symbol Override with code '{self.set_symbol_override_code}' (will use live rarity).")
             if self.apply_white_border_enabled: self.logger.info("Opt Feature: Apply White Border ENABLED")
+            if self.skip_basic_land_enabled: self.logger.info("Opt Feature: Skip Basic Lands ENABLED")
         try:
             self.setup_driver(headless=headless) 
             if not self.navigate_to_card_conjurer(): return 
@@ -988,6 +1000,7 @@ def main():
     opt_group.add_argument('--set-symbol-override', type=str, default=None, metavar='CODE', 
                        help='Override set symbol with CODE (e.g., "MH2"). Live rarity from Collector tab will be used.')
     opt_group.add_argument('--white-border', action='store_true', help='Apply the white border frame change.')
+    opt_group.add_argument('--skip-basic-land', action='store_true', help='Skip processing cards named Forest, Island, Mountain, Plains, or Swamp.')
 
     webserver_upload_group = p.add_argument_group('Web Server Upload Options')
     webserver_upload_group.add_argument(
@@ -1027,7 +1040,8 @@ def main():
         output_server_path=a.output_server_path,
         overwrite_server_file=a.overwrite_server_file,
         upload_timeout=a.upload_timeout,
-        apply_white_border=a.white_border
+        apply_white_border=a.white_border,
+        skip_basic_land=a.skip_basic_land
     )
     downloader.run(cardconjurer_file=a.file,headless=a.headless,frame=a.frame, args_for_optional_features=a)
 
