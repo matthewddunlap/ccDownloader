@@ -19,7 +19,7 @@ import time
 import json
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import zipfile
 import base64 
@@ -48,25 +48,76 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver.common.action_chains import ActionChains
 
 # --- Web Server Upload Functions (from MtgPng2Pdf.py) ---
-def check_server_file_exists(url: str, debug: bool = False) -> bool:
-    """Check if a file already exists at a given URL using a HEAD request."""
+# --- NEW: Helper function for parsing time strings ---
+def parse_time_string(time_str: str, logger) -> Optional[datetime]:
+    """Parses a timestamp string (yyyy-mm-dd-hh-mm-ss) or relative time (e.g., 5m, 2h) into a timezone-aware datetime object (UTC)."""
+    if not time_str:
+        return None
+    # Try parsing as a fixed timestamp first (assuming local time, then converting to UTC)
+    try:
+        local_dt = datetime.strptime(time_str, '%Y-%m-%d-%H-%M-%S')
+        # Assume the user provides the timestamp in their local time, convert it to UTC for comparison
+        utc_dt = local_dt.astimezone().replace(microsecond=0).astimezone(timezone.utc)
+        logger.debug(f"Parsed fixed time '{time_str}' as {utc_dt}")
+        return utc_dt
+    except ValueError:
+        pass
+
+    # Try parsing as relative time
+    match = re.match(r'(\d+)([mh])$', time_str.lower())
+    if match:
+        value, unit = int(match.group(1)), match.group(2)
+        # Relative time is always calculated from now
+        now_utc = datetime.now(timezone.utc)
+        if unit == 'm':
+            delta = timedelta(minutes=value)
+        elif unit == 'h':
+            delta = timedelta(hours=value)
+        else: # Should not happen with the regex
+            return None
+        
+        result_dt = now_utc - delta
+        logger.debug(f"Parsed relative time '{time_str}' as {result_dt}")
+        return result_dt
+    
+    logger.error(f"Invalid time format for '{time_str}'. Use 'yyyy-mm-dd-hh-mm-ss' or a relative time like '5m' or '2h'.")
+    return None
+# --- END ---
+
+
+# --- Web Server Upload Functions (from MtgPng2Pdf.py) ---
+def check_server_file_details(url: str, debug: bool = False) -> Tuple[bool, Optional[datetime]]:
+    """Check if a file exists at a URL and return its last-modified time as a timezone-aware UTC datetime."""
     if not url:
-        return False
+        return False, None
     if debug:
-        print(f"DEBUG: Checking for file existence at: {url}")
+        print(f"DEBUG: Checking for file details at: {url}")
     try:
         r = requests.head(url, timeout=15, allow_redirects=True)
         if r.status_code == 200:
-            if debug: print(f"DEBUG: File exists (200 OK) at {url}")
-            return True
+            last_modified_str = r.headers.get('Last-Modified')
+            if last_modified_str:
+                try:
+                    # HTTP-date format is RFC 1123, e.g., 'Wed, 21 Oct 2015 07:28:00 GMT'
+                    # We parse it and make it a timezone-aware datetime object in UTC.
+                    # We strip ' GMT' as strptime's %Z is unreliable. We know it's UTC.
+                    dt_naive = datetime.strptime(last_modified_str.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
+                    dt_aware_utc = dt_naive.replace(tzinfo=timezone.utc)
+                    if debug: print(f"DEBUG: File exists (200 OK) at {url}, Last-Modified: {dt_aware_utc}")
+                    return True, dt_aware_utc
+                except ValueError:
+                    if debug: print(f"DEBUG: Could not parse Last-Modified header: '{last_modified_str}'")
+                    return True, None # File exists, but can't parse date
+            if debug: print(f"DEBUG: File exists (200 OK) at {url}, but no Last-Modified header.")
+            return True, None # File exists but no time info
         if r.status_code == 404:
             if debug: print(f"DEBUG: File not found (404) at {url}")
-            return False
+            return False, None
         print(f"Warning: Received status {r.status_code} when checking {url}. Assuming it does not exist.")
-        return False
+        return False, None
     except requests.exceptions.RequestException as e:
         print(f"Warning: Network error while checking {url}: {e}. Assuming it does not exist.")
-        return False
+        return False, None
 
 def upload_file_to_server(url: str, file_bytes: bytes, mime_type: str, debug: bool = False) -> bool:
     """Uploads file content (bytes) to a server URL using PUT."""
@@ -120,6 +171,8 @@ class CardConjurerDownloader:
         self.image_server_base_url = kwargs.get('image_server_base_url', None)
         self.output_server_path = kwargs.get('output_server_path', None)
         self.overwrite_server_file = kwargs.get('overwrite_server_file', False)
+        self.overwrite_older_than_str = kwargs.get('overwrite_server_file_older_than', None)
+        self.overwrite_newer_than_str = kwargs.get('overwrite_server_file_newer_than', None)
         self.apply_white_border_enabled = kwargs.get('apply_white_border', False)
         self.skip_basic_land_enabled = kwargs.get('skip_basic_land', False)
         self.debug_mode = log_level == logging.DEBUG
@@ -137,6 +190,14 @@ class CardConjurerDownloader:
 
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         self.setup_logging(log_level)
+
+        self.overwrite_older_than_dt: Optional[datetime] = None
+        self.overwrite_newer_than_dt: Optional[datetime] = None
+        if self.overwrite_older_than_str:
+            self.overwrite_older_than_dt = parse_time_string(self.overwrite_older_than_str, self.logger)
+        if self.overwrite_newer_than_str:
+            self.overwrite_newer_than_dt = parse_time_string(self.overwrite_newer_than_str, self.logger)
+
         self.logger.info(f"Initialized CC Downloader (v7.1 - Auto-Retry File Generation)")
         self.logger.info(f"URL: {self.url}")
         if self.upload_to_server:
@@ -773,28 +834,70 @@ class CardConjurerDownloader:
                     skipped_cards += 1
                     continue
 
-            # --- NEW PRE-CHECK LOGIC ---
-            # Step 1: Generate the filename first to see if we even need to do any work.
+            # --- MODIFIED PRE-CHECK LOGIC ---
             output_filename = self._generate_filename(name)
-            
-            # Step 2: Check for existence if overwrite is not enabled.
-            if not self.overwrite_server_file:
-                if self.upload_to_server:
-                    path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
-                    full_path = "/".join(p for p in path_parts if p)
-                    if not full_path.startswith('/'): full_path = '/' + full_path
-                    check_url = f"{self.image_server_base_url.rstrip('/')}{full_path}"
-                    
-                    if check_server_file_exists(check_url, self.debug_mode):
+            should_skip = False
+
+            # Determine if we should skip based on file existence and overwrite flags.
+            # This logic now handles both server and local checks.
+            if self.upload_to_server:
+                path_parts = [self.output_server_path.strip('/'), output_filename.lstrip('/')]
+                full_path = "/".join(p for p in path_parts if p)
+                if not full_path.startswith('/'): full_path = '/' + full_path
+                check_url = f"{self.image_server_base_url.rstrip('/')}{full_path}"
+                
+                exists, last_modified = check_server_file_details(check_url, self.debug_mode)
+                
+                if exists:
+                    if self.overwrite_server_file:
+                        should_skip = False # Unconditional overwrite
+                    elif self.overwrite_older_than_dt:
+                        if last_modified and last_modified < self.overwrite_older_than_dt:
+                            self.logger.info(f"Overwriting '{output_filename}' as server file is older than {self.overwrite_older_than_str}.")
+                            should_skip = False
+                        else:
+                            self.logger.info(f"Skipping '{output_filename}', server file is not older than {self.overwrite_older_than_str} (or has no timestamp).")
+                            should_skip = True
+                    elif self.overwrite_newer_than_dt:
+                        if last_modified and last_modified > self.overwrite_newer_than_dt:
+                            self.logger.info(f"Overwriting '{output_filename}' as server file is newer than {self.overwrite_newer_than_str}.")
+                            should_skip = False
+                        else:
+                            self.logger.info(f"Skipping '{output_filename}', server file is not newer than {self.overwrite_newer_than_str} (or has no timestamp).")
+                            should_skip = True
+                    else: # Default behavior: skip if exists and no overwrite flag
                         self.logger.info(f"Skipping '{output_filename}', file exists on server.")
-                        skipped_cards += 1
-                        continue # Skip to the next card in the loop
-                else: # Local directory mode
-                    local_filepath = os.path.join(self.output_dir, output_filename)
-                    if os.path.exists(local_filepath):
+                        should_skip = True
+            else: # Local directory mode
+                local_filepath = os.path.join(self.output_dir, output_filename)
+                if os.path.exists(local_filepath):
+                    if self.overwrite_server_file:
+                        should_skip = False # Unconditional overwrite
+                    elif self.overwrite_older_than_dt or self.overwrite_newer_than_dt:
+                        file_mod_time_ts = os.path.getmtime(local_filepath)
+                        file_mod_time_dt = datetime.fromtimestamp(file_mod_time_ts, timezone.utc)
+                        
+                        if self.overwrite_older_than_dt:
+                            if file_mod_time_dt < self.overwrite_older_than_dt:
+                                self.logger.info(f"Overwriting '{output_filename}' as local file is older than {self.overwrite_older_than_str}.")
+                                should_skip = False
+                            else:
+                                self.logger.info(f"Skipping '{output_filename}', local file is not older than {self.overwrite_older_than_str}.")
+                                should_skip = True
+                        elif self.overwrite_newer_than_dt:
+                            if file_mod_time_dt > self.overwrite_newer_than_dt:
+                                self.logger.info(f"Overwriting '{output_filename}' as local file is newer than {self.overwrite_newer_than_str}.")
+                                should_skip = False
+                            else:
+                                self.logger.info(f"Skipping '{output_filename}', local file is not newer than {self.overwrite_newer_than_str}.")
+                                should_skip = True
+                    else: # Default behavior
                         self.logger.info(f"Skipping '{output_filename}', file exists in output directory.")
-                        skipped_cards += 1
-                        continue # Skip to the next card in the loop
+                        should_skip = True
+
+            if should_skip:
+                skipped_cards += 1
+                continue # Skip to the next card in the loop
             # --- END OF PRE-CHECK LOGIC ---
             
             is_first_card_and_was_successfully_primed = (i == 0 and current_canvas_hash is not None)
@@ -1019,6 +1122,14 @@ def main():
         "--overwrite-server-file", action="store_true",
         help="If a file with the same name exists on the server or in the local output directory, overwrite it. Default is to skip."
     )
+    webserver_upload_group.add_argument(
+        "--overwrite-server-file-older-than", type=str, default=None, metavar='TIME',
+        help="Overwrite if the file is OLDER than the given timestamp (yyyy-mm-dd-hh-mm-ss) or relative time (e.g., 5m, 2h)."
+    )
+    webserver_upload_group.add_argument(
+        "--overwrite-server-file-newer-than", type=str, default=None, metavar='TIME',
+        help="Overwrite if the file is NEWER than the given timestamp (yyyy-mm-dd-hh-mm-ss) or relative time (e.g., 5m, 2h)."
+    )
     
     a = p.parse_args()
     if not os.path.exists(a.file): print(f"Error: File not found: {a.file}");sys.exit(1)
@@ -1028,6 +1139,9 @@ def main():
             p.error("--upload-to-server requires --image-server-base-url.")
         if not a.output_server_path:
             p.error("--upload-to-server requires --output-server-path.")
+
+    if a.overwrite_server_file_older_than and a.overwrite_server_file_newer_than:
+        p.error("Cannot use --overwrite-server-file-older-than and --overwrite-server-file-newer-than together.")
 
     log_lvl_val = getattr(logging, a.log_level.upper(), logging.INFO)
     
@@ -1039,6 +1153,8 @@ def main():
         image_server_base_url=a.image_server_base_url,
         output_server_path=a.output_server_path,
         overwrite_server_file=a.overwrite_server_file,
+        overwrite_server_file_older_than=a.overwrite_server_file_older_than,
+        overwrite_server_file_newer_than=a.overwrite_server_file_newer_than,
         upload_timeout=a.upload_timeout,
         apply_white_border=a.white_border,
         skip_basic_land=a.skip_basic_land
