@@ -183,6 +183,45 @@ class TextMixin:
         except Exception as e:
             print(f"      An unexpected error occurred in _apply_rules_text_bounds_mods: {e}", file=sys.stderr)
 
+    def _apply_hide_reminder_text(self):
+        """
+        Clicks the 'Hide reminder text' checkbox if the flag is enabled.
+        """
+        if not self.hide_reminder_text:
+            return
+
+        print("   Applying hide reminder text setting...")
+        try:
+            # 1. Ensure we're on the Text tab
+            self.text_tab.click()
+            time.sleep(0.5)  # Wait for tab to fully load
+
+            # 2. Find the checkbox
+            checkbox = self.wait.until(EC.presence_of_element_located((By.ID, 'hide-reminder-text')))
+            
+            # 3. Check if it's already checked using JavaScript
+            is_checked = self.driver.execute_script("return arguments[0].checked;", checkbox)
+            
+            # 4. Click if not already checked - use JavaScript since the checkbox is styled
+            if not is_checked:
+                # Use JavaScript to click and trigger the onchange event
+                self.driver.execute_script("""
+                    arguments[0].checked = true;
+                    arguments[0].dispatchEvent(new Event('change'));
+                """, checkbox)
+                print("      'Hide reminder text' checkbox enabled.")
+                
+                # 5. Wait for rendering
+                time.sleep(0.5)
+            else:
+                print("      'Hide reminder text' checkbox already enabled.")
+
+        except (TimeoutException, NoSuchElementException) as e:
+            print(f"      An error occurred while applying hide reminder text: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"      An unexpected error occurred in _apply_hide_reminder_text: {e}", file=sys.stderr)
+
+
     def _process_all_text_modifications(self):
         """
         Orchestrator for all text modifications to prevent race conditions.

@@ -192,6 +192,12 @@ def main():
     )
 
     parser.add_argument(
+        '--hide-reminder-text',
+        action='store_true',
+        help="Check the 'Hide reminder text' checkbox."
+    )
+
+    parser.add_argument(
         '--image-server',
         help="The base URL of the web server where custom art is stored (e.g., 'http://mtgproxy:4242')."
     )
@@ -322,6 +328,7 @@ def main():
             rules_down=args.rules_down,
             rules_bounds_y=args.rules_bounds_y,
             rules_bounds_height=args.rules_bounds_height,
+            hide_reminder_text=args.hide_reminder_text,
             image_server=args.image_server,
             image_server_path=args.image_server_path,
             art_path=args.art_path,

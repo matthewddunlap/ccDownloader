@@ -52,6 +52,7 @@ class CardConjurerAutomator(CanvasMixin, TextMixin, ImageMixin, PrintMixin):
                  title_font_size=None, title_shadow=None, title_kerning=None, title_left=None,
                  type_font_size=None, type_shadow=None, type_kerning=None, type_left=None,
                  flavor_font=None, rules_down=None, rules_bounds_y=None, rules_bounds_height=None,
+                 hide_reminder_text=False,
                  image_server=None, image_server_path=None, art_path='/art/', autofit_art=False,
                  upscale_art=False, ilaria_url=None, upscaler_model='RealESRGAN_x2plus', upscaler_factor=4,
                  upload_path=None, upload_secret=None,
@@ -98,6 +99,7 @@ class CardConjurerAutomator(CanvasMixin, TextMixin, ImageMixin, PrintMixin):
         self.rules_down = rules_down
         self.rules_bounds_y = rules_bounds_y
         self.rules_bounds_height = rules_bounds_height
+        self.hide_reminder_text = hide_reminder_text
 
         self.type_font_size = type_font_size
         self.type_shadow = type_shadow
@@ -365,10 +367,12 @@ class CardConjurerAutomator(CanvasMixin, TextMixin, ImageMixin, PrintMixin):
                     self._apply_text_mods("Rules Text", down=self.rules_down)
                     self._apply_flavor_font_mod()
                     self._apply_rules_text_bounds_mods()
+                    self._apply_hide_reminder_text()
             else:
                 self._apply_text_mods("Rules Text", down=self.rules_down)
                 self._apply_flavor_font_mod()
                 self._apply_rules_text_bounds_mods()
+                self._apply_hide_reminder_text()
             if self.apply_white_border_on_capture:
                 self.apply_white_border()
                 mods_applied = True
